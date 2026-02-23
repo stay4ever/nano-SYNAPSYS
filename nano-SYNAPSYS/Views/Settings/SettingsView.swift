@@ -6,6 +6,8 @@ struct SettingsView: View {
     @State private var showChangePassword    = false
     @State private var screenshotDetected    = false
     @State private var notificationsEnabled  = true
+    @State private var showInviteSheet       = false
+    @StateObject private var groupsVM        = GroupsViewModel()
 
     var body: some View {
         NavigationStack {
@@ -54,6 +56,16 @@ struct SettingsView: View {
                                 }
                                 .padding(.vertical, 4)
                             }
+                            Divider().background(Color.neonGreen.opacity(0.08))
+                            Button { showInviteSheet = true } label: {
+                                HStack {
+                                    Image(systemName: "envelope.fill").foregroundColor(.matrixGreen).frame(width: 22)
+                                    Text("Invite Someone").font(.monoBody).foregroundColor(.neonGreen)
+                                    Spacer()
+                                    Image(systemName: "chevron.right").foregroundColor(.matrixGreen.opacity(0.5)).font(.system(size: 12))
+                                }
+                                .padding(.vertical, 4)
+                            }
                         }
 
                         // About
@@ -87,6 +99,9 @@ struct SettingsView: View {
                     Text("SETTINGS").font(.monoHeadline).foregroundColor(.neonGreen).glowText()
                 }
             }
+        }
+        .sheet(isPresented: $showInviteSheet) {
+            InviteSheet(vm: groupsVM)
         }
         .alert("Sign Out?", isPresented: $showLogoutConfirm) {
             Button("Sign Out", role: .destructive) { auth.logout() }

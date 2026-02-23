@@ -10,6 +10,11 @@ struct MainTabView: View {
                     Label("Chats", systemImage: "bubble.left.and.bubble.right.fill")
                 }
 
+            GroupsListView()
+                .tabItem {
+                    Label("Groups", systemImage: "person.3.fill")
+                }
+
             ContactsView()
                 .tabItem {
                     Label("Contacts", systemImage: "person.2.fill")

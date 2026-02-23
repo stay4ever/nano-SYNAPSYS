@@ -41,6 +41,11 @@
 		450EE32A63CB4BED873DA79A = {isa = PBXBuildFile; fileRef = B202E1F5D7EE4CB7B5DBEC4B; };
 		65C0CC61AA0D48E187404C6E = {isa = PBXBuildFile; fileRef = F6E15081408C4DBF87A64CA7; };
 		B674CA3C04B54EB6A9C5A89E = {isa = PBXBuildFile; fileRef = C29EC9456B0B47A7A826B0A9; };
+		91762E2F6FF146D7A3A4B1BC = {isa = PBXBuildFile; fileRef = 675F9BD7833D409284ED3B85; };
+		26D6E481816344369547B5AF = {isa = PBXBuildFile; fileRef = E9876FE55FB24BE4A808E498; };
+		BC40967AEBC747208E752EF0 = {isa = PBXBuildFile; fileRef = 0557D8DCF1AE4733872761B7; };
+		EE550D7DBF964742A5A6E265 = {isa = PBXBuildFile; fileRef = 1BFBAEED953541E886BE2EB3; };
+		8F4CD8A59C4848038A571EA9 = {isa = PBXBuildFile; fileRef = 44FCAF490E8948B3B3951B44; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -80,6 +85,11 @@
 		F18C7510F9BD47D3BD0FC1C0 = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		C29EC9456B0B47A7A826B0A9 = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		72A141E5E5AF4DA4B99AF567 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "nano-SYNAPSYS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		675F9BD7833D409284ED3B85 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Group.swift"; sourceTree = "<group>"; };
+		E9876FE55FB24BE4A808E498 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GroupChatViewModel.swift"; sourceTree = "<group>"; };
+		0557D8DCF1AE4733872761B7 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GroupsViewModel.swift"; sourceTree = "<group>"; };
+		1BFBAEED953541E886BE2EB3 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GroupChatView.swift"; sourceTree = "<group>"; };
+		44FCAF490E8948B3B3951B44 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GroupsListView.swift"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -121,6 +131,7 @@
 				41C0FDFFF4A54347B49B405D,
 				120C4EC38E534B2695F5CDBF,
 				5E7D1FA59BCC4256849650F8,
+				675F9BD7833D409284ED3B85,
 			);
 			path = "Models";
 			sourceTree = "<group>";
@@ -145,6 +156,8 @@
 				2DE9CB0358454977AE883E3E,
 				DF089213D0774BFFAFE765AD,
 				48C647F3E11144EB97AC714A,
+				E9876FE55FB24BE4A808E498,
+				0557D8DCF1AE4733872761B7,
 			);
 			path = "ViewModels";
 			sourceTree = "<group>";
@@ -164,6 +177,7 @@
 			children = (
 				348797FF9DC64DD39BD855B7,
 				359DA86FE2F146548C8B14BA,
+				44FCAF490E8948B3B3951B44,
 			);
 			path = "Main";
 			sourceTree = "<group>";
@@ -174,6 +188,7 @@
 				DBB2A8D46D1E40E0A09DCE0D,
 				B348EF163F84408F8382F22B,
 				9BFA2949F4214943A5104C1D,
+				1BFBAEED953541E886BE2EB3,
 			);
 			path = "Chat";
 			sourceTree = "<group>";
@@ -331,6 +346,11 @@
 				D66FE9CADEE64638AC3B2F72,
 				450EE32A63CB4BED873DA79A,
 				65C0CC61AA0D48E187404C6E,
+				91762E2F6FF146D7A3A4B1BC,
+				26D6E481816344369547B5AF,
+				BC40967AEBC747208E752EF0,
+				EE550D7DBF964742A5A6E265,
+				8F4CD8A59C4848038A571EA9,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

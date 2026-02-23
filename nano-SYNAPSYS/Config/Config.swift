@@ -13,6 +13,8 @@ enum Config {
         static let messages      = "\(baseURL)/api/messages"
         static let botChat       = "\(baseURL)/api/bot/chat"
         static let passwordReset = "\(baseURL)/auth/password-reset"
+        static let groups        = "\(baseURL)/api/groups"
+        static let invites       = "\(baseURL)/api/invites"
     }
 
     enum Keychain {

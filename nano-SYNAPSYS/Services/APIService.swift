@@ -144,4 +144,49 @@ actor APIService {
                                      body: body, responseType: BotChatResponse.self)
         return resp.reply
     }
+
+    // MARK: - Groups
+
+    func groups() async throws -> [Group] {
+        return try await request(Config.API.groups, responseType: [Group].self)
+    }
+
+    func createGroup(name: String, description: String) async throws -> Group {
+        struct Body: Encodable { let name, description: String }
+        return try await request(Config.API.groups, method: "POST",
+                                 body: Body(name: name, description: description),
+                                 responseType: Group.self)
+    }
+
+    func groupMessages(groupId: Int) async throws -> [GroupMessage] {
+        return try await request("\(Config.API.groups)/\(groupId)/messages",
+                                 responseType: [GroupMessage].self)
+    }
+
+    func addGroupMember(groupId: Int, userId: Int) async throws -> Group {
+        struct Body: Encodable { let user_id: Int }
+        return try await request("\(Config.API.groups)/\(groupId)/members", method: "POST",
+                                 body: Body(user_id: userId), responseType: Group.self)
+    }
+
+    func removeGroupMember(groupId: Int, userId: Int) async throws {
+        struct Body: Encodable { let user_id: Int }
+        struct Resp: Decodable { let removed: Bool }
+        _ = try await request("\(Config.API.groups)/\(groupId)/members", method: "DELETE",
+                              body: Body(user_id: userId), responseType: Resp.self)
+    }
+
+    func deleteGroup(groupId: Int) async throws {
+        struct Resp: Decodable { let deleted: Bool }
+        _ = try await request("\(Config.API.groups)/\(groupId)", method: "DELETE",
+                              responseType: Resp.self)
+    }
+
+    // MARK: - Invites
+
+    func createInvite() async throws -> InviteResponse {
+        struct Body: Encodable {}
+        return try await request(Config.API.invites, method: "POST",
+                                 body: Body(), responseType: InviteResponse.self)
+    }
 }

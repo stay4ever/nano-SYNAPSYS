@@ -3,36 +3,49 @@ import Combine
 
 struct WSMessage: Decodable {
     let type: String
-    let fromUser: Int?
-    let toUser: Int?
+    // DM fields
+    let id: Int?
+    let from: Int?
+    let to: Int?
     let content: String?
-    let messageId: Int?
+    let createdAt: String?
+    // Group message fields
+    let groupId: Int?
+    let fromUsername: String?
+    let fromDisplay: String?
+    // User list
     let users: [WSUser]?
 
     enum CodingKeys: String, CodingKey {
-        case type
-        case fromUser  = "from_user"
-        case toUser    = "to_user"
-        case content
-        case messageId = "message_id"
-        case users
+        case type, id, content, from, to, users
+        case createdAt    = "createdAt"
+        case groupId      = "group_id"
+        case fromUsername = "fromUsername"
+        case fromDisplay  = "fromDisplay"
     }
 }
 
 struct WSUser: Decodable {
     let id: Int
     let username: String
+    let displayName: String?
     let online: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id, username, online
+        case displayName = "displayName"
+    }
 }
 
 @MainActor
 final class WebSocketService: ObservableObject {
     static let shared = WebSocketService()
 
-    @Published var onlineUserIds: Set<Int> = []
+    @Published var onlineUserIds: Set<Int>        = []
     @Published var incomingMessage: Message?
-    @Published var typingUsers: Set<Int>    = []
-    @Published var isConnected              = false
+    @Published var incomingGroupMessage: GroupMessage?
+    @Published var typingUsers: Set<Int>           = []
+    @Published var isConnected                     = false
 
     private var webSocketTask: URLSessionWebSocketTask?
     private var pingTimer: Timer?
@@ -59,12 +72,17 @@ final class WebSocketService: ObservableObject {
     }
 
     func sendTyping(to userId: Int) {
-        let payload: [String: Any] = ["type": "typing", "to_user": userId]
+        let payload: [String: Any] = ["type": "typing", "to": userId]
         send(payload)
     }
 
-    func markRead(messageId: Int) {
-        let payload: [String: Any] = ["type": "read", "message_id": messageId]
+    func markRead(from userId: Int) {
+        let payload: [String: Any] = ["type": "mark_read", "from": userId]
+        send(payload)
+    }
+
+    func sendGroupMessage(groupId: Int, content: String) {
+        let payload: [String: Any] = ["type": "group_message", "group_id": groupId, "content": content]
         send(payload)
     }
 
@@ -86,7 +104,6 @@ final class WebSocketService: ObservableObject {
             case .failure:
                 Task { @MainActor in
                     self.isConnected = false
-                    // Reconnect after 3 s
                     try? await Task.sleep(nanoseconds: 3_000_000_000)
                     self.connect()
                 }
@@ -99,25 +116,46 @@ final class WebSocketService: ObservableObject {
               let msg  = try? JSONDecoder().decode(WSMessage.self, from: data) else { return }
 
         switch msg.type {
-        case "chat":
-            if let from = msg.fromUser, let to = msg.toUser, let content = msg.content, let id = msg.messageId {
-                let message = Message(id: id, fromUser: from, toUser: to,
-                                      content: content, read: false,
-                                      createdAt: ISO8601DateFormatter().string(from: Date()))
+        case "chat_message":
+            if let from = msg.from, let to = msg.to, let content = msg.content, let id = msg.id {
+                let message = Message(
+                    id: id, fromUser: from, toUser: to,
+                    content: content, read: false,
+                    createdAt: msg.createdAt ?? ISO8601DateFormatter().string(from: Date())
+                )
                 incomingMessage = message
             }
-        case "users_list", "user_status":
+
+        case "group_message":
+            if let id = msg.id,
+               let gid = msg.groupId,
+               let from = msg.from,
+               let content = msg.content,
+               let username = msg.fromUsername,
+               let display = msg.fromDisplay {
+                let gm = GroupMessage(
+                    id: id, groupId: gid,
+                    fromUser: from, fromUsername: username, fromDisplay: display,
+                    content: content,
+                    createdAt: msg.createdAt ?? ISO8601DateFormatter().string(from: Date())
+                )
+                incomingGroupMessage = gm
+            }
+
+        case "user_list":
             if let users = msg.users {
                 onlineUserIds = Set(users.filter { $0.online }.map { $0.id })
             }
+
         case "typing":
-            if let from = msg.fromUser {
+            if let from = msg.from {
                 typingUsers.insert(from)
                 Task {
                     try? await Task.sleep(nanoseconds: 3_000_000_000)
                     await MainActor.run { self.typingUsers.remove(from) }
                 }
             }
+
         default: break
         }
     }
