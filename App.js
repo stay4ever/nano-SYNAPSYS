@@ -3159,7 +3159,44 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
   const [contactsLoading,setContactsLoading]= useState(false);
   const [contactsQuery,  setContactsQuery]  = useState('');
   const [inviting,       setInviting]       = useState(null);
+  const [phoneStatuses,  setPhoneStatuses]  = useState({});   // normalizedPhone → { s:'c'|'i', e?:ms }
   const searchDebounceRef = useRef(null);
+
+  // ── Phone status helpers ─────────────────────────────────────────
+  const _PHONE_KEY = 'nano_phone_statuses';
+  const _nrmPhone  = (p) => (p || '').replace(/[\s\-().+]/g, '');
+
+  const _loadPhoneStatuses = async () => {
+    try {
+      const raw = await SecureStore.getItemAsync(_PHONE_KEY);
+      if (!raw) return {};
+      const map = JSON.parse(raw);
+      const now = Date.now();
+      let changed = false;
+      for (const k of Object.keys(map)) {
+        if (map[k].s === 'i' && map[k].e && map[k].e < now) { delete map[k]; changed = true; }
+      }
+      if (changed) SecureStore.setItemAsync(_PHONE_KEY, JSON.stringify(map)).catch(() => {});
+      return map;
+    } catch { return {}; }
+  };
+
+  const _savePhoneStatus = async (phone, entry) => {
+    const normalized = _nrmPhone(phone);
+    if (!normalized) return;
+    const map = await _loadPhoneStatuses();
+    map[normalized] = entry;
+    try { await SecureStore.setItemAsync(_PHONE_KEY, JSON.stringify(map)); } catch {}
+    setPhoneStatuses(prev => ({ ...prev, [normalized]: entry }));
+  };
+
+  const getPhoneStatus = (phone) => {
+    const normalized = _nrmPhone(phone);
+    const entry = phoneStatuses[normalized];
+    if (!entry) return null;
+    if (entry.s === 'i' && entry.e && entry.e < Date.now()) return null;
+    return entry.s;  // 'c' = contact (green) | 'i' = invited (amber)
+  };
 
   const fetchAll = useCallback(async (isRefresh = false) => {
     if (isRefresh) setRefreshing(true); else setLoading(true);
@@ -3229,6 +3266,9 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
       );
       return;
     }
+    // Load persisted phone statuses (contact / pending invite)
+    const loaded = await _loadPhoneStatuses();
+    setPhoneStatuses(loaded);
     setShowInvite(true);
     setContactsLoading(true);
     try {
@@ -3266,25 +3306,32 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
       const inviteToken = tokenMatch ? tokenMatch[1] : null;
       const deepLink = inviteToken ? `nanosynapsys://join/${inviteToken}` : null;
       const msg = deepLink
-        ? `${senderName} invited you to nano-SYNAPSYS — private encrypted messaging.\n\n1. Download the app: https://apps.apple.com/app/id6759710350\n2. Open this link to join: ${deepLink}\n\nOr register at: ${inviteUrl}\n(One-use invite, expires in 7 days)`
-        : `${senderName} invited you to nano-SYNAPSYS — private encrypted messaging by AI Evolution. Join here: ${inviteUrl} (expires in 7 days, one-use only)`;
+        ? `${senderName} invited you to nano-SYNAPSYS — private encrypted messaging.\n\n1. Download the app: https://apps.apple.com/app/id6759710350\n2. Open this link to join: ${deepLink}\n\nOr register at: ${inviteUrl}\n(One-use invite, expires in 25 minutes)`
+        : `${senderName} invited you to nano-SYNAPSYS — private encrypted messaging by AI Evolution. Join here: ${inviteUrl} (expires in 25 minutes, one-use only)`;
 
       // Normalize phone number — strip whitespace/formatting
       const phone = (contact.phone || '').replace(/\s+/g, '');
       const isAvailable = await SMS.isAvailableAsync();
 
+      let sent = false;
       if (isAvailable) {
         const { result } = await SMS.sendSMSAsync([phone], msg);
         if (result !== 'cancelled') {
-          Alert.alert('INVITE SENT', `Invite sent to ${contact.name}.\n\nThey will receive a link to join nano-SYNAPSYS.`);
+          sent = true;
+          Alert.alert('INVITE SENT', `Invite sent to ${contact.name}.\n\nThey have 25 minutes to join using the link.`);
         }
       } else {
         // Fallback: copy invite link to clipboard
         await Clipboard.setStringAsync(inviteUrl);
+        sent = true;
         Alert.alert(
           'LINK COPIED',
           `SMS is not available on this device.\n\nThe invite link has been copied to your clipboard — paste it and share with ${contact.name}.`,
         );
+      }
+      // Mark phone as pending invite (amber LED, 25-minute window)
+      if (sent) {
+        await _savePhoneStatus(contact.phone, { s: 'i', e: Date.now() + 25 * 60 * 1000 });
       }
     } catch (e) {
       Alert.alert('ERROR', e.message || 'Failed to send invite. Please try again.');
@@ -3325,12 +3372,15 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
           ],
         );
       } else if (newMatches.length === 0) {
-        // Found on app but already in contacts
+        // Found on app but already in contacts — mark green
         const name = knownMatches[0].displayName || knownMatches[0].username;
+        await _savePhoneStatus(contact.phone, { s: 'c' });
         Alert.alert('\u2713 ALREADY IN CONTACTS', `${name} is already in your contacts. Tap their name to chat.`);
       } else if (newMatches.length === 1) {
         setShowInvite(false);
         await addContact(newMatches[0].id);
+        // Mark green — this phone contact is now on the app and in contacts
+        await _savePhoneStatus(contact.phone, { s: 'c' });
         Alert.alert('\u2713 ADDED', `${newMatches[0].displayName || newMatches[0].username} is now in your contacts.`);
       } else {
         // Multiple new matches — open search panel pre-filled so user picks the right one
@@ -3446,10 +3496,21 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
         <View style={styles.modalOverlay}>
           <View style={[styles.modalBox, { maxHeight: '85%' }]}>
             <Text style={styles.modalTitle}>MY PHONE CONTACTS</Text>
-            <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 10, color: C.dim, marginBottom: 10, letterSpacing: 0.5 }}>
-              FIND ON APP — search nano-SYNAPSYS users by name{'\n'}
-              INVITE — send an SMS invite link to join
-            </Text>
+
+            {/* LED legend */}
+            <View style={{ flexDirection: 'row', gap: 16, marginBottom: 10 }}>
+              {[
+                { color: C.accent, label: 'CONTACT' },
+                { color: C.amber,  label: 'INVITE SENT' },
+                { color: C.red,    label: 'NOT CONNECTED' },
+              ].map(({ color, label }) => (
+                <View key={label} style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
+                  <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: color }} />
+                  <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 9, color: C.dim, letterSpacing: 0.3 }}>{label}</Text>
+                </View>
+              ))}
+            </View>
+
             <TextInput
               style={[styles.input, { marginBottom: 8 }]}
               placeholder="SEARCH CONTACTS..."
@@ -3465,32 +3526,46 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
               <ScrollView style={{ flex: 1 }} keyboardShouldPersistTaps="handled">
                 {deviceContacts
                   .filter(c => !contactsQuery.trim() || c.name.toLowerCase().includes(contactsQuery.toLowerCase()) || c.phone.includes(contactsQuery))
-                  .map(c => (
-                    <View key={c.id} style={[styles.contactRow, { flexDirection: 'column', alignItems: 'flex-start', gap: 6 }]}>
-                      <View style={styles.contactRowInfo}>
-                        <Text style={styles.contactRowName}>{c.name}</Text>
-                        <Text style={styles.contactRowMeta}>{c.phone}</Text>
+                  .map(c => {
+                    const ps = getPhoneStatus(c.phone);  // 'c' | 'i' | null
+                    const ledColor = ps === 'c' ? C.accent : ps === 'i' ? C.amber : C.red;
+                    return (
+                      <View key={c.id} style={[styles.contactRow, { paddingVertical: 10 }]}>
+                        {/* LED dot */}
+                        <View style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: ledColor, marginRight: 10, alignSelf: 'center' }} />
+                        {/* Name + phone */}
+                        <View style={[styles.contactRowInfo, { flex: 1 }]}>
+                          <Text style={styles.contactRowName}>{c.name}</Text>
+                          <Text style={styles.contactRowMeta}>{c.phone}</Text>
+                        </View>
+                        {/* Action area */}
+                        {ps === 'c' ? (
+                          <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 10, color: C.accent, letterSpacing: 0.5 }}>✓ CONTACT</Text>
+                        ) : ps === 'i' ? (
+                          <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 10, color: C.amber, letterSpacing: 0.5 }}>PENDING</Text>
+                        ) : (
+                          <View style={{ flexDirection: 'row', gap: 6 }}>
+                            <TouchableOpacity
+                              style={styles.contactActionBtn}
+                              onPress={() => findOnApp(c)}
+                            >
+                              <Text style={styles.contactActionBtnText}>FIND</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                              style={[styles.contactActionBtn, { borderColor: C.amber }]}
+                              onPress={() => sendSMSInvite(c)}
+                              disabled={inviting === c.id}
+                            >
+                              {inviting === c.id
+                                ? <Spinner />
+                                : <Text style={[styles.contactActionBtnText, { color: C.amber }]}>INVITE</Text>
+                              }
+                            </TouchableOpacity>
+                          </View>
+                        )}
                       </View>
-                      <View style={{ flexDirection: 'row', gap: 8 }}>
-                        <TouchableOpacity
-                          style={[styles.contactActionBtn, { flex: 1 }]}
-                          onPress={() => findOnApp(c)}
-                        >
-                          <Text style={styles.contactActionBtnText}>FIND ON APP</Text>
-                        </TouchableOpacity>
-                        <TouchableOpacity
-                          style={[styles.contactActionBtn, { flex: 1, borderColor: C.amber }]}
-                          onPress={() => sendSMSInvite(c)}
-                          disabled={inviting === c.id}
-                        >
-                          {inviting === c.id
-                            ? <Spinner />
-                            : <Text style={[styles.contactActionBtnText, { color: C.amber }]}>INVITE</Text>
-                          }
-                        </TouchableOpacity>
-                      </View>
-                    </View>
-                  ))
+                    );
+                  })
                 }
                 {deviceContacts.length === 0 && !contactsLoading && (
                   <Text style={styles.emptyText}>NO CONTACTS WITH PHONE NUMBERS</Text>
