@@ -1855,7 +1855,7 @@ function SwipeableRow({ children, rightLabel = 'DELETE', rightColor, onAction, d
     onStartShouldSetPanResponder: () => false,
     // Claim horizontal gestures; let vertical scroll through unimpeded
     onMoveShouldSetPanResponder: (_, { dx, dy }) =>
-      !R.current.disabled && Math.abs(dx) > 6 && Math.abs(dx) > Math.abs(dy) * 1.8,
+      !R.current.disabled && Math.abs(dx) > 14 && Math.abs(dx) > Math.abs(dy) * 2.5,
 
     onPanResponderGrant: () => {
       fired.current = false;
@@ -3310,9 +3310,12 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
     }
     try {
       const data = await api(`/api/users/search?q=${encodeURIComponent(q)}`, 'GET', null, token);
-      const matches = Array.isArray(data) ? data.filter(u => !contactUserIds.has(u.id)) : [];
-      if (matches.length === 0) {
-        // Not on app — offer to send invite directly
+      const allMatches   = Array.isArray(data) ? data : [];
+      const newMatches   = allMatches.filter(u => !contactUserIds.has(u.id));
+      const knownMatches = allMatches.filter(u =>  contactUserIds.has(u.id));
+
+      if (allMatches.length === 0) {
+        // Genuinely not on the app — offer invite
         Alert.alert(
           'NOT ON APP YET',
           `"${contact.name}" doesn't have nano-SYNAPSYS.\n\nSend them an invite? They'll be added to your contacts automatically when they join.`,
@@ -3321,12 +3324,16 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
             { text: 'SEND INVITE', onPress: () => sendSMSInvite(contact) },
           ],
         );
-      } else if (matches.length === 1) {
+      } else if (newMatches.length === 0) {
+        // Found on app but already in contacts
+        const name = knownMatches[0].displayName || knownMatches[0].username;
+        Alert.alert('\u2713 ALREADY IN CONTACTS', `${name} is already in your contacts. Tap their name to chat.`);
+      } else if (newMatches.length === 1) {
         setShowInvite(false);
-        await addContact(matches[0].id);
-        Alert.alert('\u2713 ADDED', `${matches[0].displayName || matches[0].username} is now in your contacts.`);
+        await addContact(newMatches[0].id);
+        Alert.alert('\u2713 ADDED', `${newMatches[0].displayName || newMatches[0].username} is now in your contacts.`);
       } else {
-        // Multiple matches — open search panel pre-filled so user picks the right one
+        // Multiple new matches — open search panel pre-filled so user picks the right one
         setShowInvite(false);
         setQuery(q);
         setShowSearch(true);
