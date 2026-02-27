@@ -2,7 +2,7 @@
   "expo": {
     "name": "nano-SYNAPSYS",
     "slug": "nano-synapsys",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -14,7 +14,7 @@
     },
     "ios": {
       "bundleIdentifier": "com.aievolution.nanosynapsys",
-      "buildNumber": "2",
+      "buildNumber": "3",
       "supportsTablet": false,
       "icon": "./assets/icon.png",
       "infoPlist": {
@@ -23,12 +23,12 @@
         "NSCameraUsageDescription": "nano-SYNAPSYS uses the camera to capture images for chat.",
         "NSPhotoLibraryUsageDescription": "nano-SYNAPSYS accesses your photos to send images in chat.",
         "NSLocationWhenInUseUsageDescription": "nano-SYNAPSYS uses your location to attach GPS coordinates to your profile.",
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": true
       }
     },
     "android": {
       "package": "com.aievolution.nanosynapsys",
-      "versionCode": 2,
+      "versionCode": 3,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#050f05"

@@ -26,3 +26,4 @@ web-build/
 ngrok_recovery_codes.txt
 .env
 .env.local
+/ios

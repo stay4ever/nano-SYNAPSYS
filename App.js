@@ -44,6 +44,10 @@ import * as Contacts from 'expo-contacts';
 import * as SMS from 'expo-sms';
 import * as Notifications from 'expo-notifications';
 import Svg, { Path, Circle, Line, G, Polygon, Rect, Defs, Pattern } from 'react-native-svg';
+// tweetnacl — pure-JS NaCl cryptography (no native linking required)
+// eslint-disable-next-line import/no-commonjs
+const nacl     = require('tweetnacl');
+const naclUtil = require('tweetnacl-util');
 
 // ---------------------------------------------------------------------------
 // COLOUR PALETTES
@@ -645,6 +649,211 @@ const DISAPPEAR_OPTIONS = [
 const KAV_BEHAVIOR = Platform.OS === 'ios' ? 'padding' : 'height';
 
 // ---------------------------------------------------------------------------
+// E2EE — NaCl (X25519 + XSalsa20-Poly1305)  — module-level singletons
+// ---------------------------------------------------------------------------
+// Session keypair {publicKey: Uint8Array, secretKey: Uint8Array}
+let _e2eeKey      = null;
+// { [userId]: base64PubKey }
+const _pkCache    = {};
+// { [groupId]: Uint8Array(32) }
+const _groupKeyCache = {};
+
+const E2EE_SK_STORE = 'e2ee_secret_key';
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+const _b64enc = (buf) => naclUtil.encodeBase64(buf);
+const _b64dec = (str) => naclUtil.decodeBase64(str);
+
+/** Return the loaded keypair, or null if not yet initialised. */
+function e2eeKey() { return _e2eeKey; }
+
+/**
+ * Initialise E2EE for this session.
+ *  1. Load secret key from SecureStore (or generate + persist if new).
+ *  2. Upload the public key to the server.
+ */
+async function initE2EE(token) {
+  try {
+    let skB64 = await SecureStore.getItemAsync(E2EE_SK_STORE);
+    let kp;
+    if (skB64) {
+      try {
+        const sk = _b64dec(skB64);
+        kp = nacl.box.keyPair.fromSecretKey(sk);
+      } catch {
+        // Stored key is corrupted — discard it and generate a fresh keypair
+        kp = nacl.box.keyPair();
+        await SecureStore.setItemAsync(E2EE_SK_STORE, _b64enc(kp.secretKey));
+      }
+    } else {
+      kp = nacl.box.keyPair();
+      await SecureStore.setItemAsync(E2EE_SK_STORE, _b64enc(kp.secretKey));
+    }
+    _e2eeKey = kp;
+    // Upload public key to server (fire-and-forget — non-blocking)
+    api('/api/keys', 'POST', { public_key: _b64enc(kp.publicKey) }, token).catch(() => {});
+  } catch {}
+}
+
+/** Fetch and cache the public key for a user. Returns base64 string or null. */
+async function fetchPubKey(userId, token) {
+  if (_pkCache[userId]) return _pkCache[userId];
+  try {
+    const data = await api(`/api/keys/${userId}`, 'GET', null, token);
+    if (data?.public_key) { _pkCache[userId] = data.public_key; return data.public_key; }
+  } catch {}
+  return null;
+}
+
+/**
+ * Encrypt a DM plaintext for a recipient.
+ * Returns a JSON envelope string: {"enc":1,"nonce":"…","ct":"…","spk":"…","rpk":"…"}
+ * spk = sender public key, rpk = recipient public key.
+ */
+function encryptDM(plaintext, recipientPkB64) {
+  if (!_e2eeKey) return null;
+  try {
+    const nonce      = nacl.randomBytes(nacl.box.nonceLength);
+    const msgBytes   = naclUtil.decodeUTF8(plaintext);
+    const recipientPk = _b64dec(recipientPkB64);
+    const ct         = nacl.box(msgBytes, nonce, recipientPk, _e2eeKey.secretKey);
+    return JSON.stringify({
+      enc:   1,
+      nonce: _b64enc(nonce),
+      ct:    _b64enc(ct),
+      spk:   _b64enc(_e2eeKey.publicKey),
+      rpk:   recipientPkB64,
+    });
+  } catch { return null; }
+}
+
+/**
+ * Decrypt a DM envelope string received from the server.
+ * Returns the plaintext, or null if decryption fails.
+ */
+function decryptDM(envelopeStr) {
+  if (!_e2eeKey) return null;
+  try {
+    const env    = JSON.parse(envelopeStr);
+    if (env.enc !== 1) return null;
+    const nonce  = _b64dec(env.nonce);
+    const ct     = _b64dec(env.ct);
+    const myPkB64 = _b64enc(_e2eeKey.publicKey);
+    // Choose "their" key: if I am the sender (spk === mine), use rpk; else use spk
+    const theirPkB64 = (env.spk === myPkB64) ? env.rpk : env.spk;
+    const theirPk    = _b64dec(theirPkB64);
+    const plain      = nacl.box.open(ct, nonce, theirPk, _e2eeKey.secretKey);
+    return plain ? naclUtil.encodeUTF8(plain) : null;
+  } catch { return null; }
+}
+
+/** Return true if a message content string looks like an E2EE DM envelope. */
+function isEncryptedDM(content) {
+  return typeof content === 'string' && content.startsWith('{"enc":1');
+}
+
+/**
+ * Encrypt a group message with the group's symmetric key.
+ * Returns a JSON envelope string: {"enc":2,"nonce":"…","ct":"…"}
+ */
+function encryptGroupMsg(plaintext, groupKey) {
+  if (!groupKey) return null;
+  try {
+    const nonce    = nacl.randomBytes(nacl.secretbox.nonceLength);
+    const msgBytes = naclUtil.decodeUTF8(plaintext);
+    const ct       = nacl.secretbox(msgBytes, nonce, groupKey);
+    return JSON.stringify({ enc: 2, nonce: _b64enc(nonce), ct: _b64enc(ct) });
+  } catch { return null; }
+}
+
+/**
+ * Decrypt a group message envelope.
+ * Returns the plaintext, or null on failure.
+ */
+function decryptGroupMsg(envelopeStr, groupKey) {
+  if (!groupKey) return null;
+  try {
+    const env   = JSON.parse(envelopeStr);
+    if (env.enc !== 2) return null;
+    const nonce = _b64dec(env.nonce);
+    const ct    = _b64dec(env.ct);
+    const plain = nacl.secretbox.open(ct, nonce, groupKey);
+    return plain ? naclUtil.encodeUTF8(plain) : null;
+  } catch { return null; }
+}
+
+/** Return true if a content string looks like an E2EE group envelope. */
+function isEncryptedGroup(content) {
+  return typeof content === 'string' && content.startsWith('{"enc":2');
+}
+
+/**
+ * Encrypt the group key (Uint8Array) for a member using nacl.box.
+ * Returns a JSON string: {"nonce":"…","ct":"…"} or null on failure.
+ */
+function encryptKeyForMember(groupKey, memberPkB64) {
+  if (!_e2eeKey || !groupKey) return null;
+  try {
+    const nonce     = nacl.randomBytes(nacl.box.nonceLength);
+    const memberPk  = _b64dec(memberPkB64);
+    const ct        = nacl.box(groupKey, nonce, memberPk, _e2eeKey.secretKey);
+    return JSON.stringify({ nonce: _b64enc(nonce), ct: _b64enc(ct) });
+  } catch { return null; }
+}
+
+/**
+ * Decrypt a group key envelope (JSON string) using nacl.box.
+ * distributorPkB64 = the admin's public key that encrypted the key for us.
+ * Returns Uint8Array(32) or null.
+ */
+function decryptGroupKey(encryptedKeyJson, distributorPkB64) {
+  if (!_e2eeKey) return null;
+  try {
+    const env          = JSON.parse(encryptedKeyJson);
+    const nonce        = _b64dec(env.nonce);
+    const ct           = _b64dec(env.ct);
+    const distributorPk = _b64dec(distributorPkB64);
+    const plain        = nacl.box.open(ct, nonce, distributorPk, _e2eeKey.secretKey);
+    return plain;   // 32-byte Uint8Array
+  } catch { return null; }
+}
+
+/**
+ * Load the group key for groupId — try cache first, then server.
+ * Returns Uint8Array(32) or null.
+ */
+async function loadGroupKey(groupId, token) {
+  if (_groupKeyCache[groupId]) return _groupKeyCache[groupId];
+  try {
+    const data = await api(`/api/groups/${groupId}/key`, 'GET', null, token);
+    if (data?.encrypted_key && data?.distributor_pk) {
+      const key = decryptGroupKey(data.encrypted_key, data.distributor_pk);
+      if (key) { _groupKeyCache[groupId] = key; return key; }
+    }
+  } catch {}
+  return null;
+}
+
+/** Generate a fresh 32-byte group key, distribute it to all member public keys,
+ *  upload via POST /api/groups/<id>/key, and cache locally. */
+async function generateAndDistributeGroupKey(groupId, memberPubKeys, token) {
+  if (!_e2eeKey) return;
+  const groupKey = nacl.randomBytes(nacl.secretbox.keyLength); // 32 bytes
+  _groupKeyCache[groupId] = groupKey;
+
+  const keys = [];
+  for (const { userId, publicKey } of memberPubKeys) {
+    if (!publicKey) continue;
+    const encKey = encryptKeyForMember(groupKey, publicKey);
+    if (encKey) keys.push({ user_id: userId, encrypted_key: encKey, distributor_pk: _b64enc(_e2eeKey.publicKey) });
+  }
+  if (keys.length > 0) {
+    api(`/api/groups/${groupId}/key`, 'POST', { keys }, token).catch(() => {});
+  }
+}
+
+// ---------------------------------------------------------------------------
 // API HELPER
 // ---------------------------------------------------------------------------
 async function api(path, method = 'GET', body = null, token = null) {
@@ -1077,9 +1286,22 @@ function GroupMembersModal({ token, group, currentUser, visible, onClose }) {
     finally { setActioning(a => ({ ...a, [key]: false })); }
   };
 
-  const addMember = (userId) => act(`add_${userId}`, () =>
-    api(`/api/groups/${group.id}/members`, 'POST', { user_id: userId }, token)
-  );
+  const addMember = (userId) => act(`add_${userId}`, async () => {
+    await api(`/api/groups/${group.id}/members`, 'POST', { user_id: userId }, token);
+    // Distribute group key to the new member if we have it cached
+    const cachedKey = _groupKeyCache[group.id];
+    if (cachedKey && e2eeKey()) {
+      const memberPkB64 = await fetchPubKey(userId, token);
+      if (memberPkB64) {
+        const encKey = encryptKeyForMember(cachedKey, memberPkB64);
+        if (encKey) {
+          api(`/api/groups/${group.id}/key`, 'POST', {
+            keys: [{ user_id: userId, encrypted_key: encKey, distributor_pk: _b64enc(e2eeKey().publicKey) }],
+          }, token).catch(() => {});
+        }
+      }
+    }
+  });
 
   const removeMember = (userId) => {
     Alert.alert('REMOVE MEMBER', 'Remove this member from the group?', [
@@ -1676,6 +1898,25 @@ function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
 
   useEffect(() => { fetchUsers(); }, [fetchUsers]);
 
+  const deleteChat = (user) => {
+    Alert.alert(
+      'CLEAR CONVERSATION',
+      `Delete all messages with ${user.displayName || user.username}? This cannot be undone.`,
+      [
+        { text: 'CANCEL', style: 'cancel' },
+        {
+          text: 'DELETE',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await api(`/api/messages/delete/${user.id}`, 'DELETE', null, token);
+            } catch (e) { setErr(e.message); }
+          },
+        },
+      ]
+    );
+  };
+
   if (loading) return <View style={styles.centerFill}><Spinner size="large" /></View>;
 
   return (
@@ -1688,23 +1929,25 @@ function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
         renderItem={({ item }) => {
           const cnt = unread[`dm_${item.id}`] || 0;
           return (
-            <TouchableOpacity style={styles.userRow} onPress={() => onOpenDM(item)}>
-              <View style={styles.userRowLeft}>
-                <OnlineDot online={item.online} />
-                <View style={styles.userRowInfo}>
-                  <Text style={styles.userRowName}>{item.displayName || item.display_name || item.username}</Text>
-                  <Text style={styles.userRowMeta}>{item.online ? 'ONLINE' : item.last_seen ? `LAST SEEN ${fmtDate(item.last_seen)}` : 'OFFLINE'}</Text>
-                </View>
-              </View>
-              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                {cnt > 0 && (
-                  <View style={styles.rowBadge}>
-                    <Text style={styles.rowBadgeText}>{cnt > 99 ? '99+' : cnt}</Text>
+            <SwipeableRow rightLabel="CLEAR" rightColor={C.red} onAction={() => deleteChat(item)}>
+              <TouchableOpacity style={styles.userRow} onPress={() => onOpenDM(item)}>
+                <View style={styles.userRowLeft}>
+                  <OnlineDot online={item.online} />
+                  <View style={styles.userRowInfo}>
+                    <Text style={styles.userRowName}>{item.displayName || item.display_name || item.username}</Text>
+                    <Text style={styles.userRowMeta}>{item.online ? 'ONLINE' : item.last_seen ? `LAST SEEN ${fmtDate(item.last_seen)}` : 'OFFLINE'}</Text>
                   </View>
-                )}
-                <Text style={styles.chevron}>{'>'}</Text>
-              </View>
-            </TouchableOpacity>
+                </View>
+                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                  {cnt > 0 && (
+                    <View style={styles.rowBadge}>
+                      <Text style={styles.rowBadgeText}>{cnt > 99 ? '99+' : cnt}</Text>
+                    </View>
+                  )}
+                  <Text style={styles.chevron}>{'>'}</Text>
+                </View>
+              </TouchableOpacity>
+            </SwipeableRow>
           );
         }}
         ItemSeparatorComponent={() => <View style={styles.separator} />}
@@ -1725,6 +1968,12 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
   const [err, setErr]           = useState('');
   const listRef                 = useRef(null);
   const disappearTimers         = useRef([]);
+  const peerPkRef               = useRef(null);  // cached peer public key
+
+  // Pre-fetch peer's public key for E2EE
+  useEffect(() => {
+    fetchPubKey(peer.id, token).then(pk => { peerPkRef.current = pk; }).catch(() => {});
+  }, [peer.id, token]);
 
   // Clean up all pending disappear timers on unmount
   useEffect(() => () => { disappearTimers.current.forEach(clearTimeout); }, []);
@@ -1777,15 +2026,25 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
     setSending(true);
     const isImage = typeof content === 'string' && content.startsWith('data:');
     try {
+      // E2EE: encrypt text messages (not images — images are large binary data)
+      let payload = content;
+      if (!isImage && peerPkRef.current && e2eeKey()) {
+        payload = encryptDM(content, peerPkRef.current);
+        if (payload === null) {
+          Alert.alert('ENCRYPTION ERROR', 'Could not encrypt message. Send aborted.');
+          setSending(false);
+          return;
+        }
+      }
       // Images always go via REST (too large for the WebSocket frame limit).
       // Text goes via WebSocket for real-time delivery; falls back to REST when WS is down.
       if (!isImage && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        const msgPayload = { type: 'chat_message', to: peer.id, content };
+        const msgPayload = { type: 'chat_message', to: peer.id, content: payload };
         if (disappear) msgPayload.disappear_after = disappear;
         wsRef.current.send(JSON.stringify(msgPayload));
         // No optimistic push — the server echoes the message back via WS which adds it
       } else {
-        const msg = await api('/api/messages', 'POST', { to: peer.id, content }, token);
+        const msg = await api('/api/messages', 'POST', { to: peer.id, content: payload }, token);
         setMessages((prev) => prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]);
       }
     } catch (e) { setErr(e.message); if (!overrideContent) setText(content); }
@@ -1841,6 +2100,14 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
   }, [sendMessage]);
 
   const isMine = (msg) => String(msg.from_user?.id ?? msg.from_user) === String(currentUser.id);
+  // Resolve plaintext from a message — decrypt if E2EE, else return as-is
+  const resolveContent = (content) => {
+    if (isEncryptedDM(content)) {
+      const plain = decryptDM(content);
+      return { text: plain ?? '[Encrypted — cannot decrypt]', encrypted: true, failed: !plain };
+    }
+    return { text: content, encrypted: false, failed: false };
+  };
 
   return (
     <ThemedSafeArea>
@@ -1863,14 +2130,15 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
               ListEmptyComponent={<Text style={styles.emptyText}>NO MESSAGES YET</Text>}
               renderItem={({ item }) => {
                 const mine = isMine(item);
+                const { text: msgText, encrypted: isEnc, failed } = resolveContent(item.content);
                 return (
                   <View style={[styles.msgRow, mine ? styles.msgRowMine : styles.msgRowTheirs]}>
                     <View style={[styles.msgBubble, mine ? styles.bubbleMine : styles.bubbleTheirs]}>
                       {isImageContent(item.content) ? (
                         <Image source={{ uri: item.content }} style={styles.imageMsg} resizeMode="contain" />
-                      ) : isLocationContent(item.content) ? (
+                      ) : isLocationContent(msgText) ? (
                         <TouchableOpacity onPress={() => {
-                          const m = item.content.match(/\[LOCATION:([-\d.]+),([-\d.]+)\]/);
+                          const m = msgText.match(/\[LOCATION:([-\d.]+),([-\d.]+)\]/);
                           if (m) Linking.openURL(`https://maps.google.com/?q=${m[1]},${m[2]}`);
                         }}>
                           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
@@ -1878,14 +2146,17 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
                             <Text style={[styles.msgText, { color: mine ? '#fff' : C.accent }]}>Location shared</Text>
                           </View>
                           <Text style={[styles.msgTime, { marginTop: 2 }]}>
-                            {item.content.match(/\[LOCATION:([-\d.]+),([-\d.]+)\]/)?.[0].replace('[LOCATION:', '').replace(']', '') || ''}
+                            {msgText.match(/\[LOCATION:([-\d.]+),([-\d.]+)\]/)?.[0].replace('[LOCATION:', '').replace(']', '') || ''}
                           </Text>
                           <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 9, color: mine ? '#ffffffaa' : C.dim, marginTop: 2 }}>
                             TAP TO OPEN IN MAPS
                           </Text>
                         </TouchableOpacity>
                       ) : (
-                        <Text style={styles.msgText}>{item.content}</Text>
+                        <>
+                          {isEnc && <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 8, color: mine ? '#ffffff66' : C.dim, marginBottom: 2, letterSpacing: 0.5 }}>{failed ? '🔓 DECRYPTION FAILED' : '🔒 E2EE'}</Text>}
+                          <Text style={[styles.msgText, failed && { color: C.amber }]}>{msgText}</Text>
+                        </>
                       )}
                       <View style={styles.msgMeta}>
                         <Text style={styles.msgTime}>{fmtTime(item.created_at)}</Text>
@@ -1950,6 +2221,11 @@ function GroupsTab({ token, onOpenGroup, unread = {} }) {
     try {
       const g = await api('/api/groups', 'POST', { name: newName.trim(), description: newDesc.trim() }, token);
       setGroups((prev) => [g, ...prev]); setShowForm(false); setNewName(''); setNewDesc('');
+      // Generate and distribute group key (creator is the only member initially)
+      if (e2eeKey()) {
+        const myPkB64 = _b64enc(e2eeKey().publicKey);
+        await generateAndDistributeGroupKey(g.id, [{ userId: g.created_by, publicKey: myPkB64 }], token);
+      }
     } catch (e) { setCreateErr(e.message); }
     finally { setCreating(false); }
   };
@@ -2051,8 +2327,14 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
   const [showMembers, setShowMembers] = useState(false);
   const listRef                     = useRef(null);
   const disappearTimers             = useRef([]);
+  const groupKeyRef                 = useRef(null);  // cached Uint8Array group key
 
   useEffect(() => () => { disappearTimers.current.forEach(clearTimeout); }, []);
+
+  // Load group symmetric key for E2EE
+  useEffect(() => {
+    loadGroupKey(group.id, token).then(k => { groupKeyRef.current = k; }).catch(() => {});
+  }, [group.id, token]);
 
   const fetchHistory = useCallback(async () => {
     setLoading(true); setErr('');
@@ -2094,11 +2376,21 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
     setSending(true);
     const isImage = typeof content === 'string' && content.startsWith('data:');
     try {
+      // E2EE: encrypt text messages with the group symmetric key
+      let payload = content;
+      if (!isImage && groupKeyRef.current) {
+        payload = encryptGroupMsg(content, groupKeyRef.current);
+        if (payload === null) {
+          Alert.alert('ENCRYPTION ERROR', 'Could not encrypt group message. Send aborted.');
+          setSending(false);
+          return;
+        }
+      }
       if (!isImage && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'group_message', group_id: group.id, content }));
+        wsRef.current.send(JSON.stringify({ type: 'group_message', group_id: group.id, content: payload }));
         // No optimistic push — the server echoes the message back via WS which adds it
       } else {
-        const msg = await api(`/api/groups/${group.id}/messages`, 'POST', { content }, token);
+        const msg = await api(`/api/groups/${group.id}/messages`, 'POST', { content: payload }, token);
         setMessages((prev) => prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]);
       }
     } catch (e) { setErr(e.message); if (!overrideContent) setText(content); }
@@ -2156,6 +2448,13 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
     const id = msg.from_user?.id ?? msg.from_user ?? msg.from;
     return String(id) === String(currentUser.id);
   };
+  const resolveGroupContent = (content) => {
+    if (isEncryptedGroup(content)) {
+      const plain = decryptGroupMsg(content, groupKeyRef.current);
+      return { text: plain ?? '[Encrypted — cannot decrypt]', encrypted: true, failed: !plain };
+    }
+    return { text: content, encrypted: false, failed: false };
+  };
 
   return (
     <ThemedSafeArea>
@@ -2187,15 +2486,16 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
               renderItem={({ item }) => {
                 const mine = isMine(item);
                 const senderName = mine ? 'YOU' : (item.from_display || item.fromDisplay || item.from_username || item.fromUsername || 'UNKNOWN');
+                const { text: msgText, encrypted: isEnc, failed } = resolveGroupContent(item.content);
                 return (
                   <View style={[styles.msgRow, mine ? styles.msgRowMine : styles.msgRowTheirs]}>
                     <View style={[styles.msgBubble, mine ? styles.bubbleMine : styles.bubbleTheirs]}>
                       {!mine && <Text style={styles.msgSender}>{senderName}</Text>}
                       {isImageContent(item.content) ? (
                         <Image source={{ uri: item.content }} style={styles.imageMsg} resizeMode="contain" />
-                      ) : isLocationContent(item.content) ? (
+                      ) : isLocationContent(msgText) ? (
                         <TouchableOpacity onPress={() => {
-                          const m = item.content.match(/\[LOCATION:([-\d.]+),([-\d.]+)\]/);
+                          const m = msgText.match(/\[LOCATION:([-\d.]+),([-\d.]+)\]/);
                           if (m) Linking.openURL(`https://maps.google.com/?q=${m[1]},${m[2]}`);
                         }}>
                           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
@@ -2207,7 +2507,10 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
                           </Text>
                         </TouchableOpacity>
                       ) : (
-                        <Text style={styles.msgText}>{item.content}</Text>
+                        <>
+                          {isEnc && <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 8, color: mine ? '#ffffff66' : C.dim, marginBottom: 2, letterSpacing: 0.5 }}>{failed ? '🔓 DECRYPTION FAILED' : '🔒 E2EE'}</Text>}
+                          <Text style={[styles.msgText, failed && { color: C.amber }]}>{msgText}</Text>
+                        </>
                       )}
                       <Text style={styles.msgTime}>{fmtTime(item.created_at)}</Text>
                     </View>
@@ -2317,7 +2620,7 @@ function BotTab({ token }) {
   const canSend = (text.trim().length > 0 || pendingImage !== null) && !loading;
 
   return (
-    <KeyboardAvoidingView style={styles.flex} behavior={KAV_BEHAVIOR}>
+    <View style={styles.flex}>
       <View style={styles.botHeader}>
         <Text style={styles.botHeaderText}>BANNER AI</Text>
         <View style={[{ width: 8, height: 8, borderRadius: 4, marginLeft: 8 }, { backgroundColor: C.green }]} />
@@ -2327,6 +2630,7 @@ function BotTab({ token }) {
       </View>
       <FlatList
         ref={listRef} data={messages} keyExtractor={(m) => String(m.id)}
+        style={styles.flex}
         contentContainerStyle={styles.msgList}
         renderItem={({ item }) => {
           const isBot = item.role === 'bot';
@@ -2374,7 +2678,7 @@ function BotTab({ token }) {
           {loading ? <Spinner /> : <Text style={styles.sendBtnText}>SEND</Text>}
         </TouchableOpacity>
       </View>
-    </KeyboardAvoidingView>
+    </View>
   );
 }
 
@@ -2733,11 +3037,6 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
   };
 
   const sendSMSInvite = async (contact) => {
-    const isAvailable = await SMS.isAvailableAsync();
-    if (!isAvailable) {
-      Alert.alert('SMS NOT AVAILABLE', 'This device cannot send SMS messages.');
-      return;
-    }
     setInviting(contact.id);
     try {
       const data = await api('/api/invites', 'POST', {}, token);
@@ -2749,14 +3048,46 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
       const senderName = currentUser?.display_name || currentUser?.username || 'A friend';
       const msg =
         `${senderName} invited you to nano-SYNAPSYS — private encrypted messaging by AI Evolution. Join here: ${inviteUrl} (expires in 7 days, one-use only)`;
-      const { result } = await SMS.sendSMSAsync([contact.phone], msg);
-      if (result !== 'cancelled') {
-        Alert.alert('INVITE SENT', `Invite sent to ${contact.name}.\n\nThey will receive a link to join nano-SYNAPSYS.`);
+
+      // Normalize phone number — strip whitespace/formatting
+      const phone = (contact.phone || '').replace(/\s+/g, '');
+      const isAvailable = await SMS.isAvailableAsync();
+
+      if (isAvailable) {
+        const { result } = await SMS.sendSMSAsync([phone], msg);
+        if (result !== 'cancelled') {
+          Alert.alert('INVITE SENT', `Invite sent to ${contact.name}.\n\nThey will receive a link to join nano-SYNAPSYS.`);
+        }
+      } else {
+        // Fallback: copy invite link to clipboard
+        await Clipboard.setStringAsync(inviteUrl);
+        Alert.alert(
+          'LINK COPIED',
+          `SMS is not available on this device.\n\nThe invite link has been copied to your clipboard — paste it and share with ${contact.name}.`,
+        );
       }
     } catch (e) {
-      Alert.alert('ERROR', e.message);
+      Alert.alert('ERROR', e.message || 'Failed to send invite. Please try again.');
     } finally {
       setInviting(null);
+    }
+  };
+
+  // Find app users whose username/displayName contains the contact's name words
+  const findOnApp = (contact) => {
+    const words = contact.name.toLowerCase().split(/\s+/).filter(w => w.length > 1);
+    const matches = users.filter(u =>
+      words.some(w =>
+        (u.username || '').toLowerCase().includes(w) ||
+        (u.displayName || '').toLowerCase().includes(w)
+      )
+    );
+    if (matches.length === 0) {
+      Alert.alert('NOT FOUND', `No nano-SYNAPSYS users found matching "${contact.name}".\n\nSend them an SMS invite to join.`);
+    } else {
+      setShowInvite(false);
+      setQuery(contact.name.split(' ')[0]); // pre-fill search
+      setShowSearch(true);
     }
   };
 
@@ -2903,19 +3234,20 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
 
       <View style={styles.separator} />
 
-      {/* ── INVITE VIA SMS ──────────────────────────────────────── */}
+      {/* ── INVITE / PHONE CONTACTS ──────────────────────────────── */}
       <TouchableOpacity style={[styles.addContactBtn, { borderColor: C.amber, flexDirection: 'row', gap: 8 }]} onPress={openInviteModal}>
         <IconSMS size={15} color={C.amber} />
-        <Text style={[styles.addContactBtnText, { color: C.amber }]}>INVITE VIA SMS</Text>
+        <Text style={[styles.addContactBtnText, { color: C.amber }]}>FROM MY PHONE CONTACTS</Text>
       </TouchableOpacity>
 
-      {/* ── INVITE MODAL ───────────────────────────────────────── */}
+      {/* ── PHONE CONTACTS MODAL ─────────────────────────────────── */}
       <Modal visible={showInvite} transparent animationType="slide" onRequestClose={() => { setShowInvite(false); setContactsQuery(''); }}>
         <View style={styles.modalOverlay}>
-          <View style={[styles.modalBox, { maxHeight: '80%' }]}>
-            <Text style={styles.modalTitle}>INVITE CONTACT</Text>
+          <View style={[styles.modalBox, { maxHeight: '85%' }]}>
+            <Text style={styles.modalTitle}>MY PHONE CONTACTS</Text>
             <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 10, color: C.dim, marginBottom: 10, letterSpacing: 0.5 }}>
-              Select a contact to send them an invite link via SMS.
+              FIND ON APP — search nano-SYNAPSYS users by name{'\n'}
+              INVITE — send an SMS invite link to join
             </Text>
             <TextInput
               style={[styles.input, { marginBottom: 8 }]}
@@ -2933,23 +3265,29 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
                 {deviceContacts
                   .filter(c => !contactsQuery.trim() || c.name.toLowerCase().includes(contactsQuery.toLowerCase()) || c.phone.includes(contactsQuery))
                   .map(c => (
-                    <View key={c.id} style={styles.contactRow}>
-                      <View style={styles.contactRowLeft}>
-                        <View style={styles.contactRowInfo}>
-                          <Text style={styles.contactRowName}>{c.name}</Text>
-                          <Text style={styles.contactRowMeta}>{c.phone}</Text>
-                        </View>
+                    <View key={c.id} style={[styles.contactRow, { flexDirection: 'column', alignItems: 'flex-start', gap: 6 }]}>
+                      <View style={styles.contactRowInfo}>
+                        <Text style={styles.contactRowName}>{c.name}</Text>
+                        <Text style={styles.contactRowMeta}>{c.phone}</Text>
                       </View>
-                      <TouchableOpacity
-                        style={[styles.contactActionBtn, { borderColor: C.amber }]}
-                        onPress={() => sendSMSInvite(c)}
-                        disabled={inviting === c.id}
-                      >
-                        {inviting === c.id
-                          ? <Spinner />
-                          : <Text style={[styles.contactActionBtnText, { color: C.amber }]}>INVITE</Text>
-                        }
-                      </TouchableOpacity>
+                      <View style={{ flexDirection: 'row', gap: 8 }}>
+                        <TouchableOpacity
+                          style={[styles.contactActionBtn, { flex: 1 }]}
+                          onPress={() => findOnApp(c)}
+                        >
+                          <Text style={styles.contactActionBtnText}>FIND ON APP</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={[styles.contactActionBtn, { flex: 1, borderColor: C.amber }]}
+                          onPress={() => sendSMSInvite(c)}
+                          disabled={inviting === c.id}
+                        >
+                          {inviting === c.id
+                            ? <Spinner />
+                            : <Text style={[styles.contactActionBtnText, { color: C.amber }]}>INVITE</Text>
+                          }
+                        </TouchableOpacity>
+                      </View>
                     </View>
                   ))
                 }
@@ -3268,6 +3606,8 @@ function HomeScreen({ token, currentUser, onLogout }) {
   useEffect(() => {
     loadDisappear().then(v => setDisappear(v));
     loadNotifEnabled().then(v => { setNotifEnabled(v); notifRef.current = v; });
+    // Initialise E2EE keypair (generate if new, upload public key)
+    initE2EE(token);
     // Register Expo push token with backend
     (async () => {
       try {
@@ -3318,8 +3658,10 @@ function HomeScreen({ token, currentUser, onLogout }) {
             // Fire local notification when not viewing that chat
             if (notifRef.current && !isViewingThisChat) {
               const sender = msg.from_user?.username || msg.fromUsername || 'Someone';
-              const preview = (typeof msg.content === 'string' && !msg.content.startsWith('data:'))
-                ? msg.content.slice(0, 80) : '[Image]';
+              let preview;
+              if (isEncryptedDM(msg.content))                          preview = 'New encrypted message';
+              else if (typeof msg.content === 'string' && msg.content.startsWith('data:')) preview = '[Image]';
+              else                                                     preview = (msg.content || '').slice(0, 80);
               showLocalNotification(`nano-SYNAPSYS \u2014 ${sender}`, preview);
             }
           }
@@ -3339,8 +3681,10 @@ function HomeScreen({ token, currentUser, onLogout }) {
             }
             if (notifRef.current && !isViewingThisGroup) {
               const sender = msg.from_display || msg.from_username || 'Group';
-              const preview = (typeof msg.content === 'string' && !msg.content.startsWith('data:'))
-                ? msg.content.slice(0, 80) : '[Image]';
+              let preview;
+              if (isEncryptedGroup(msg.content))                          preview = 'New encrypted message';
+              else if (typeof msg.content === 'string' && msg.content.startsWith('data:')) preview = '[Image]';
+              else                                                        preview = (msg.content || '').slice(0, 80);
               showLocalNotification(`nano-SYNAPSYS — ${msg.group?.name || 'Group'}`, `${sender}: ${preview}`);
             }
           }
@@ -3404,15 +3748,18 @@ function HomeScreen({ token, currentUser, onLogout }) {
         <Text style={styles.homeTitle}>nano-SYNAPSYS</Text>
         <Text style={styles.homeSubtitle}>AI EVOLUTION MESH</Text>
       </View>
-      <View style={styles.flex}>
-        {activeTab === 'CHATS'    && <ChatsTab token={token} currentUser={currentUser} onOpenDM={openDM} unread={unreadCounts} />}
-        {activeTab === 'CONTACTS' && <ContactsTab token={token} currentUser={currentUser} onOpenDM={(peer) => { openDM(peer); setActiveTab('CHATS'); }} />}
-        {activeTab === 'GROUPS'   && <GroupsTab token={token} onOpenGroup={openGroup} unread={unreadCounts} />}
-        {activeTab === 'BOT'      && <BotTab token={token} />}
-        {activeTab === 'PROFILE'  && <ProfileTab token={token} currentUser={currentUser} onLogout={onLogout} />}
-        {activeTab === 'SETTINGS' && <SettingsTab token={token} currentUser={currentUser} notifEnabled={notifEnabled} onSetNotifEnabled={handleSetNotifEnabled} />}
-      </View>
-      <TabBar active={activeTab} onChange={setActiveTab} unread={tabUnread} />
+      {/* KeyboardAvoidingView wraps content+tabbar so Banner input slides above keyboard */}
+      <KeyboardAvoidingView style={styles.flex} behavior={KAV_BEHAVIOR} enabled={activeTab === 'BOT'}>
+        <View style={styles.flex}>
+          {activeTab === 'CHATS'    && <ChatsTab token={token} currentUser={currentUser} onOpenDM={openDM} unread={unreadCounts} />}
+          {activeTab === 'CONTACTS' && <ContactsTab token={token} currentUser={currentUser} onOpenDM={(peer) => { openDM(peer); setActiveTab('CHATS'); }} />}
+          {activeTab === 'GROUPS'   && <GroupsTab token={token} onOpenGroup={openGroup} unread={unreadCounts} />}
+          {activeTab === 'BOT'      && <BotTab token={token} />}
+          {activeTab === 'PROFILE'  && <ProfileTab token={token} currentUser={currentUser} onLogout={onLogout} />}
+          {activeTab === 'SETTINGS' && <SettingsTab token={token} currentUser={currentUser} notifEnabled={notifEnabled} onSetNotifEnabled={handleSetNotifEnabled} />}
+        </View>
+        <TabBar active={activeTab} onChange={setActiveTab} unread={tabUnread} />
+      </KeyboardAvoidingView>
     </ThemedSafeArea>
   );
 }
@@ -3450,6 +3797,10 @@ function AppInner() {
   const handleAuth = useCallback((t, u) => { setToken(t); setUser(u); setAppState('home'); }, []);
   const handleLogout = useCallback(async () => {
     await clearToken(); await clearUser();
+    // Clear all in-memory E2EE state so it cannot leak to the next session.
+    _e2eeKey = null;
+    Object.keys(_pkCache).forEach(k => delete _pkCache[k]);
+    Object.keys(_groupKeyCache).forEach(k => delete _groupKeyCache[k]);
     setToken(null); setUser(null); setAppState('auth');
   }, []);
 
