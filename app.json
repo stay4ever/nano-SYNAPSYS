@@ -23,6 +23,8 @@
         "NSCameraUsageDescription": "nano-SYNAPSYS uses the camera to capture images for chat.",
         "NSPhotoLibraryUsageDescription": "nano-SYNAPSYS accesses your photos to send images in chat.",
         "NSLocationWhenInUseUsageDescription": "nano-SYNAPSYS uses your location to attach GPS coordinates to your profile.",
+        "NSCalendarsFullAccessUsageDescription": "nano-SYNAPSYS reads your calendar so Banner AI can see your schedule and create events.",
+        "NSRemindersFullAccessUsageDescription": "nano-SYNAPSYS reads your reminders so Banner AI can help manage your tasks.",
         "ITSAppUsesNonExemptEncryption": true
       }
     },
@@ -42,11 +44,20 @@
         "android.permission.READ_CONTACTS",
         "android.permission.SEND_SMS",
         "android.permission.RECEIVE_BOOT_COMPLETED",
-        "android.permission.VIBRATE"
+        "android.permission.VIBRATE",
+        "android.permission.READ_CALENDAR",
+        "android.permission.WRITE_CALENDAR"
       ]
     },
     "plugins": [
       "expo-secure-store",
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": "nano-SYNAPSYS reads your calendar so Banner AI can see your schedule and create events.",
+          "remindersPermission": "nano-SYNAPSYS reads your reminders so Banner AI can help manage your tasks."
+        }
+      ],
       [
         "expo-local-authentication",
         {

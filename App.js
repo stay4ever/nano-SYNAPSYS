@@ -43,6 +43,7 @@ import * as Location from 'expo-location';
 import * as Contacts from 'expo-contacts';
 import * as SMS from 'expo-sms';
 import * as Notifications from 'expo-notifications';
+import * as Calendar from 'expo-calendar';
 import Svg, { Path, Circle, Line, G, Polygon, Rect, Defs, Pattern } from 'react-native-svg';
 // tweetnacl — pure-JS NaCl cryptography (no native linking required)
 // eslint-disable-next-line import/no-commonjs
@@ -635,6 +636,10 @@ const DISAPPEAR_KEY = 'nano_disappear';
 const PROFILE_EXT_KEY = 'nano_profile_ext';
 const LOCATION_KEY    = 'nano_location';
 const NOTIF_KEY       = 'nano_notif_enabled';
+// Banner AI permission keys — each stores '1' (enabled) or '0' (disabled)
+const BANNER_PERM_MSGS_KEY = 'banner_perm_msgs';
+const BANNER_PERM_SEND_KEY = 'banner_perm_send';
+const BANNER_PERM_CAL_KEY  = 'banner_perm_cal';
 
 const DISAPPEAR_OPTIONS = [
   { label: 'OFF',     value: null   },
@@ -922,6 +927,8 @@ async function loadProfileExt() {
     return v ? JSON.parse(v) : {};
   } catch { return {}; }
 }
+async function loadBannerPerm(key) { return (await SecureStore.getItemAsync(key)) === '1'; }
+async function saveBannerPerm(key, val) { await SecureStore.setItemAsync(key, val ? '1' : '0'); }
 async function saveLocation(loc) {
   await SecureStore.setItemAsync(LOCATION_KEY, JSON.stringify(loc));
 }
@@ -2542,30 +2549,140 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
 // ---------------------------------------------------------------------------
 // BOT TAB
 // ---------------------------------------------------------------------------
-function BotTab({ token }) {
+function BotTab({ token, wsRef, currentUser }) {
   const { styles, C } = useSkin();
+  const mono = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
   const [messages, setMessages] = useState([{
-    id: 0, role: 'bot', content: 'BANNER AI ONLINE.\n\nI\'m your unlimited AI assistant — ask me anything, or send a photo/screenshot for analysis.',
+    id: 0, role: 'bot',
+    content: 'BANNER AI ONLINE.\n\nI\'m your unlimited AI assistant — ask me anything, send a photo for analysis, and enable permissions in Settings to let me read your messages, send on your behalf, or manage your calendar.',
     ts: new Date().toISOString(),
   }]);
-  const [text,         setText]         = useState('');
-  const [loading,      setLoading]      = useState(false);
-  const [err,          setErr]          = useState('');
-  const [typing,       setTyping]       = useState(false);
-  const [pendingImage, setPendingImage] = useState(null); // { uri, base64, mimeType }
-  const listRef                         = useRef(null);
-  const typingTimer                     = useRef(null);
+  const [text,          setText]          = useState('');
+  const [loading,       setLoading]       = useState(false);
+  const [err,           setErr]           = useState('');
+  const [typing,        setTyping]        = useState(false);
+  const [pendingImage,  setPendingImage]  = useState(null);
+  const [bpMsgs,        setBpMsgs]        = useState(false);
+  const [bpSend,        setBpSend]        = useState(false);
+  const [bpCal,         setBpCal]         = useState(false);
+  const [pendingAction, setPendingAction] = useState(null);
+  const [users,         setUsers]         = useState([]);
+  const listRef     = useRef(null);
+  const typingTimer = useRef(null);
 
   useEffect(() => {
     if (messages.length > 0) setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 100);
   }, [messages, typing]);
 
+  // Load Banner permissions from SecureStore on mount
+  useEffect(() => {
+    (async () => {
+      setBpMsgs(await loadBannerPerm(BANNER_PERM_MSGS_KEY));
+      setBpSend(await loadBannerPerm(BANNER_PERM_SEND_KEY));
+      setBpCal(await loadBannerPerm(BANNER_PERM_CAL_KEY));
+    })();
+  }, []);
+
+  // Fetch user list whenever messaging/send permissions are active
+  useEffect(() => {
+    if (!bpSend && !bpMsgs) return;
+    api('/api/users', 'GET', null, token)
+      .then(data => { if (Array.isArray(data)) setUsers(data.filter(u => !u.isMe)); })
+      .catch(() => {});
+  }, [bpSend, bpMsgs, token]);
+
+  useEffect(() => { return () => { if (typingTimer.current) clearTimeout(typingTimer.current); }; }, []);
+
+  /** Build enriched context string from enabled permissions. */
+  const buildContext = async () => {
+    const parts = [];
+    if (bpMsgs && users.length > 0) {
+      try {
+        const convos = await Promise.all(
+          users.slice(0, 5).map(async u => {
+            try {
+              const msgs = await api(`/api/messages/${u.id}`, 'GET', null, token);
+              const recent = Array.isArray(msgs) ? msgs.slice(-3) : [];
+              if (!recent.length) return null;
+              return `${u.displayName || u.username}:\n` + recent.map(m => {
+                const mine = String(m.from_user?.id ?? m.from_user) === String(currentUser?.id);
+                const body  = isEncryptedDM(m.content) ? '[encrypted]' : (m.content || '').slice(0, 120);
+                return `  ${mine ? 'Me' : (u.displayName || u.username)}: ${body}`;
+              }).join('\n');
+            } catch { return null; }
+          })
+        );
+        const digest = convos.filter(Boolean).join('\n\n');
+        if (digest) parts.push(`RECENT CONVERSATIONS:\n${digest}`);
+      } catch {}
+    }
+    if (bpCal) {
+      try {
+        const { status } = await Calendar.requestCalendarPermissionsAsync();
+        if (status === 'granted') {
+          const now  = new Date();
+          const in7d = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+          const cals = await Calendar.getCalendarsAsync(Calendar.EntityTypes.EVENT);
+          const evts = await Calendar.getEventsAsync(cals.map(c => c.id), now, in7d);
+          if (evts.length) {
+            const list = evts.slice(0, 20).map(e =>
+              `  - ${e.title}: ${new Date(e.startDate).toLocaleString()}`
+            ).join('\n');
+            parts.push(`UPCOMING CALENDAR EVENTS (next 7 days):\n${list}`);
+          }
+        }
+      } catch {}
+    }
+    return parts.join('\n\n');
+  };
+
+  /** Execute a Banner action after user confirmation. */
+  const executeAction = async (action) => {
+    setPendingAction(null);
+    try {
+      if (action.type === 'send_message') {
+        const target = users.find(u =>
+          u.username === action.to_username ||
+          (u.displayName || '').toLowerCase() === (action.to_username || '').toLowerCase()
+        );
+        if (!target) { Alert.alert('USER NOT FOUND', `"${action.to_username}" is not in your contacts.`); return; }
+        if (wsRef?.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: 'chat_message', to: target.id, content: action.content }));
+        } else {
+          await api('/api/messages', 'POST', { to: target.id, content: action.content }, token);
+        }
+        setMessages(prev => [...prev, {
+          id: Date.now(), role: 'bot',
+          content: `\u2713 Sent to ${action.to_username}: "${action.content}"`,
+          ts: new Date().toISOString(),
+        }]);
+      } else if (action.type === 'create_event') {
+        const { status } = await Calendar.requestCalendarPermissionsAsync();
+        if (status !== 'granted') { Alert.alert('PERMISSION', 'Calendar access required.'); return; }
+        const defaultCal = await Calendar.getDefaultCalendarAsync();
+        await Calendar.createEventAsync(defaultCal.id, {
+          title:     action.title,
+          startDate: new Date(action.start),
+          endDate:   new Date(action.end || action.start),
+          notes:     action.notes || '',
+          timeZone:  Intl.DateTimeFormat().resolvedOptions().timeZone,
+        });
+        setMessages(prev => [...prev, {
+          id: Date.now(), role: 'bot',
+          content: `\u2713 Event "${action.title}" added to your calendar.`,
+          ts: new Date().toISOString(),
+        }]);
+      }
+    } catch (e) { Alert.alert('ERROR', e.message); }
+  };
+
   const sendToBot = async () => {
-    const content  = text.trim();
+    const content   = text.trim();
     const imgToSend = pendingImage;
     if (!content && !imgToSend || loading) return;
     setText('');
     setPendingImage(null);
+    setPendingAction(null);
     setErr('');
     setMessages((prev) => [...prev, {
       id: Date.now(), role: 'user',
@@ -2576,10 +2693,25 @@ function BotTab({ token }) {
     setTyping(true); setLoading(true);
     typingTimer.current = setTimeout(async () => {
       try {
-        const body = { message: content || 'Describe this image.' };
+        const context = await buildContext();
+        const body = { message: content || 'Describe this image.', context };
         if (imgToSend?.base64) { body.image_base64 = imgToSend.base64; body.image_mime = imgToSend.mimeType || 'image/jpeg'; }
         const data = await api('/api/bot/chat', 'POST', body, token);
-        setMessages((prev) => [...prev, { id: Date.now() + 1, role: 'bot', content: data.reply || '...', ts: new Date().toISOString() }]);
+        const raw  = data.reply || '...';
+        // Parse optional <<<ACTION:{...}>>> block appended by Banner
+        const ACTION_RE = /<<<ACTION:([\s\S]*?)>>>/;
+        const match   = raw.match(ACTION_RE);
+        const display = raw.replace(ACTION_RE, '').trim();
+        if (match) {
+          try {
+            const action = JSON.parse(match[1]);
+            const permitted =
+              (action.type === 'send_message' && bpSend) ||
+              (action.type === 'create_event'  && bpCal);
+            if (permitted) setPendingAction(action);
+          } catch {}
+        }
+        setMessages((prev) => [...prev, { id: Date.now() + 1, role: 'bot', content: display || raw, ts: new Date().toISOString() }]);
       } catch (e) { setErr(e.message); }
       finally { setTyping(false); setLoading(false); }
     }, 400);
@@ -2615,17 +2747,16 @@ function BotTab({ token }) {
     ]);
   };
 
-  useEffect(() => { return () => { if (typingTimer.current) clearTimeout(typingTimer.current); }; }, []);
-
   const canSend = (text.trim().length > 0 || pendingImage !== null) && !loading;
+  const permTags = [bpMsgs && 'MSGS', bpSend && 'SEND', bpCal && 'CAL'].filter(Boolean).join(' \u00B7 ');
 
   return (
     <View style={styles.flex}>
       <View style={styles.botHeader}>
         <Text style={styles.botHeaderText}>BANNER AI</Text>
         <View style={[{ width: 8, height: 8, borderRadius: 4, marginLeft: 8 }, { backgroundColor: C.green }]} />
-        <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 9, color: C.dim, marginLeft: 8, letterSpacing: 1 }}>
-          UNLIMITED · VISION
+        <Text style={{ fontFamily: mono, fontSize: 9, color: C.dim, marginLeft: 8, letterSpacing: 1 }}>
+          UNLIMITED{permTags ? ` \u00B7 ${permTags}` : ' \u00B7 VISION'}
         </Text>
       </View>
       <FlatList
@@ -2661,10 +2792,39 @@ function BotTab({ token }) {
         <View style={{ paddingHorizontal: 12, paddingBottom: 6, flexDirection: 'row', alignItems: 'center' }}>
           <Image source={{ uri: pendingImage.uri }} style={{ width: 56, height: 56, borderRadius: 6, borderWidth: 1, borderColor: C.accent }} />
           <TouchableOpacity onPress={() => setPendingImage(null)} style={{ marginLeft: 8, padding: 4 }}>
-            <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 11, color: C.danger || C.amber }}>
-              {'\u2715'} REMOVE
-            </Text>
+            <Text style={{ fontFamily: mono, fontSize: 11, color: C.danger || C.amber }}>{'\u2715'} REMOVE</Text>
           </TouchableOpacity>
+        </View>
+      )}
+      {/* Pending action confirmation card */}
+      {pendingAction && (
+        <View style={{ margin: 10, padding: 12, borderRadius: 6, borderWidth: 1, borderColor: C.accent, backgroundColor: C.panel }}>
+          <Text style={{ fontFamily: mono, fontSize: 10, color: C.accent, letterSpacing: 1.5, marginBottom: 8 }}>
+            {pendingAction.type === 'send_message' ? '\u2197 BANNER WANTS TO SEND A MESSAGE' : '\uD83D\uDCC5 BANNER WANTS TO CREATE AN EVENT'}
+          </Text>
+          {pendingAction.type === 'send_message' ? (
+            <>
+              <Text style={{ fontFamily: mono, fontSize: 11, color: C.fg ?? C.green, marginBottom: 2 }}>To: {pendingAction.to_username}</Text>
+              <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, marginBottom: 10 }}>"{pendingAction.content}"</Text>
+            </>
+          ) : (
+            <>
+              <Text style={{ fontFamily: mono, fontSize: 11, color: C.fg ?? C.green, marginBottom: 2 }}>{pendingAction.title}</Text>
+              <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, marginBottom: 10 }}>{new Date(pendingAction.start).toLocaleString()}</Text>
+            </>
+          )}
+          <View style={{ flexDirection: 'row', gap: 8 }}>
+            <TouchableOpacity
+              onPress={() => executeAction(pendingAction)}
+              style={{ flex: 1, paddingVertical: 8, borderRadius: 4, backgroundColor: C.accent, alignItems: 'center' }}>
+              <Text style={{ fontFamily: mono, fontSize: 11, color: '#000', fontWeight: '700', letterSpacing: 1 }}>CONFIRM</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => setPendingAction(null)}
+              style={{ flex: 1, paddingVertical: 8, borderRadius: 4, borderWidth: 1, borderColor: C.dim, alignItems: 'center' }}>
+              <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, letterSpacing: 1 }}>CANCEL</Text>
+            </TouchableOpacity>
+          </View>
         </View>
       )}
       <View style={styles.inputRow}>
@@ -2708,6 +2868,10 @@ function ProfileTab({ token, currentUser, onLogout }) {
   const [bioPassword, setBioPassword]   = useState('');
   const [bioLoading, setBioLoading]     = useState(false);
   const [bioErr, setBioErr]             = useState('');
+  // ── Banner AI permissions ─────────────────────────────────────────────
+  const [bpMsgs, setBpMsgs] = useState(false);
+  const [bpSend, setBpSend] = useState(false);
+  const [bpCal,  setBpCal]  = useState(false);
 
   // ── editable profile fields ───────────────────────────────────────────
   const [displayName,     setDisplayName]     = useState('');
@@ -2727,6 +2891,9 @@ function ProfileTab({ token, currentUser, onLogout }) {
       setPhone(ext.phone ?? '');
       setResidentialAddr(ext.residentialAddr ?? '');
       setWorkAddr(ext.workAddr ?? '');
+      setBpMsgs(await loadBannerPerm(BANNER_PERM_MSGS_KEY));
+      setBpSend(await loadBannerPerm(BANNER_PERM_SEND_KEY));
+      setBpCal(await loadBannerPerm(BANNER_PERM_CAL_KEY));
     })();
   }, []);
 
@@ -2892,6 +3059,32 @@ function ProfileTab({ token, currentUser, onLogout }) {
           ? <TouchableOpacity style={styles.bioDisableBtn} onPress={handleDisableBio}><Text style={styles.bioDisableBtnText}>DISABLE FACE ID LOGIN</Text></TouchableOpacity>
           : <TouchableOpacity style={styles.primaryBtn} onPress={() => setShowBioModal(true)}><Text style={styles.primaryBtnText}>ENABLE FACE ID LOGIN</Text></TouchableOpacity>
       )}
+
+      <View style={styles.profileDivider} />
+
+      {/* ── BANNER PERMISSIONS ───────────────────────────────────────── */}
+      <Text style={styles.profileEditHeader}>BANNER PERMISSIONS</Text>
+      <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 10, color: C.dim, letterSpacing: 0.5, marginBottom: 14, lineHeight: 16 }}>
+        Allow Banner AI to access your data and take actions on your behalf. Actions always require your confirmation.
+      </Text>
+      {[
+        { key: BANNER_PERM_MSGS_KEY, label: 'READ CONVERSATIONS', desc: 'Banner can read recent messages to provide context-aware responses.', val: bpMsgs, set: setBpMsgs },
+        { key: BANNER_PERM_SEND_KEY, label: 'SEND MESSAGES',      desc: 'Banner can send messages as you — confirmation required each time.', val: bpSend, set: setBpSend },
+        { key: BANNER_PERM_CAL_KEY,  label: 'CALENDAR ACCESS',    desc: 'Banner can read your schedule and create events — confirmation required.', val: bpCal, set: setBpCal },
+      ].map(({ key, label, desc, val, set }) => (
+        <View key={key} style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 12, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: C.panel }}>
+          <View style={{ flex: 1, marginRight: 12 }}>
+            <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 11, color: val ? C.accent : C.text ?? C.green, letterSpacing: 1, marginBottom: 3 }}>{label}</Text>
+            <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 10, color: C.dim, lineHeight: 15 }}>{desc}</Text>
+          </View>
+          <Switch
+            value={val}
+            onValueChange={async (v) => { set(v); await saveBannerPerm(key, v); }}
+            trackColor={{ false: C.panel, true: C.accent }}
+            thumbColor={val ? C.green : C.dim}
+          />
+        </View>
+      ))}
 
       <View style={styles.profileDivider} />
 
@@ -3754,7 +3947,7 @@ function HomeScreen({ token, currentUser, onLogout }) {
           {activeTab === 'CHATS'    && <ChatsTab token={token} currentUser={currentUser} onOpenDM={openDM} unread={unreadCounts} />}
           {activeTab === 'CONTACTS' && <ContactsTab token={token} currentUser={currentUser} onOpenDM={(peer) => { openDM(peer); setActiveTab('CHATS'); }} />}
           {activeTab === 'GROUPS'   && <GroupsTab token={token} onOpenGroup={openGroup} unread={unreadCounts} />}
-          {activeTab === 'BOT'      && <BotTab token={token} />}
+          {activeTab === 'BOT'      && <BotTab token={token} wsRef={wsRef} currentUser={currentUser} />}
           {activeTab === 'PROFILE'  && <ProfileTab token={token} currentUser={currentUser} onLogout={onLogout} />}
           {activeTab === 'SETTINGS' && <SettingsTab token={token} currentUser={currentUser} notifEnabled={notifEnabled} onSetNotifEnabled={handleSetNotifEnabled} />}
         </View>
