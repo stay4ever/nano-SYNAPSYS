@@ -16,7 +16,6 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
-  Easing,
   FlatList,
   Image,
   KeyboardAvoidingView,
@@ -1653,8 +1652,6 @@ function AuthScreen({ onAuth }) {
   const [username, setUsername]       = useState('');
   const [email, setEmail]             = useState('');
   const [password, setPassword]       = useState('');
-  const [inviteCode, setInviteCode]   = useState('');
-  const [joinReason, setJoinReason]   = useState('');
   const [loading, setLoading]         = useState(false);
   const [err, setErr]                 = useState('');
   const [bioSupported, setBioSupported] = useState(false);
@@ -1671,7 +1668,7 @@ function AuthScreen({ onAuth }) {
     })();
   }, []);
 
-  const reset = () => { setUsername(''); setEmail(''); setPassword(''); setInviteCode(''); setJoinReason(''); setErr(''); };
+  const reset = () => { setUsername(''); setEmail(''); setPassword(''); setErr(''); };
   const handleTabSwitch = (t) => { setTab(t); reset(); };
 
   const handleBioLogin = async () => {
@@ -1724,9 +1721,7 @@ function AuthScreen({ onAuth }) {
     if (!username.trim() || !email.trim() || !password.trim()) { setErr('Username, email and password are required.'); return; }
     setLoading(true); setErr('');
     try {
-      const body = { username: username.trim(), email: email.trim(), password, join_reason: joinReason.trim() };
-      if (inviteCode.trim()) body.invite_code = inviteCode.trim();
-      const data = await api('/auth/register', 'POST', body);
+      const data = await api('/auth/register', 'POST', { username: username.trim(), email: email.trim(), password });
       await saveToken(data.token); await saveUser(data.user);
       onAuth(data.token, data.user);
     } catch (e) { setErr(e.message); }
@@ -1764,16 +1759,6 @@ function AuthScreen({ onAuth }) {
             )}
             <TextInput style={styles.input} placeholder="PASSWORD" placeholderTextColor={C.muted}
               value={password} onChangeText={setPassword} secureTextEntry />
-            {tab === 'REGISTER' && (
-              <TextInput style={styles.input} placeholder="INVITE CODE (OPTIONAL)" placeholderTextColor={C.muted}
-                value={inviteCode} onChangeText={setInviteCode} autoCapitalize="none" autoCorrect={false} />
-            )}
-            {tab === 'REGISTER' && (
-              <TextInput style={[styles.input, styles.inputMultiline]}
-                placeholder="WHY DO YOU WANT TO JOIN? (REQUIRED)" placeholderTextColor={C.muted}
-                value={joinReason} onChangeText={setJoinReason}
-                multiline numberOfLines={3} textAlignVertical="top" autoCorrect={false} />
-            )}
             <ErrText msg={err} />
             <TouchableOpacity style={[styles.primaryBtn, loading && styles.primaryBtnDisabled]}
               onPress={tab === 'LOGIN' ? handleLogin : handleRegister} disabled={loading}>
@@ -1802,7 +1787,7 @@ function AuthScreen({ onAuth }) {
 // SWIPEABLE ROW  (pure Animated + PanResponder — no extra packages)
 // Swipe left to reveal a destructive action button. Swipe right to close.
 // ---------------------------------------------------------------------------
-const _SWIPE_W = 76; // width of the revealed action button
+const _SWIPE_W = 88; // width of the revealed action button
 
 function SwipeableRow({ children, rightLabel = 'DELETE', rightColor, onAction, disabled = false }) {
   const { C } = useSkin();
@@ -1816,11 +1801,12 @@ function SwipeableRow({ children, rightLabel = 'DELETE', rightColor, onAction, d
   const dragStart = useRef(0); // actual position when the finger goes down
 
   const snapTo = useCallback((toValue) => {
-    Animated.timing(position, {
+    Animated.spring(position, {
       toValue,
-      duration: 160,
-      easing: Easing.out(Easing.cubic),
       useNativeDriver: true,
+      tension: 80,
+      friction: 12,
+      overshootClamping: true,
     }).start();
   }, [position]);
 
@@ -1908,7 +1894,7 @@ function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
   const deleteChat = (user) => {
     Alert.alert(
       'CLEAR CONVERSATION',
-      `Delete all messages with ${user.displayName || user.username}? This cannot be undone.`,
+      `Delete all messages with ${user.displayName || user.username}?`,
       [
         { text: 'CANCEL', style: 'cancel' },
         {
@@ -1917,6 +1903,7 @@ function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
           onPress: async () => {
             try {
               await api(`/api/messages/delete/${user.id}`, 'DELETE', null, token);
+              setUsers(prev => prev.filter(u => u.id !== user.id));
             } catch (e) { setErr(e.message); }
           },
         },
@@ -2182,7 +2169,8 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
                 <IconPin size={18} color={C.accent} />
               </TouchableOpacity>
               <TextInput style={styles.chatInput} placeholder="MESSAGE..." placeholderTextColor={C.muted}
-                value={text} onChangeText={setText} multiline maxLength={2000} />
+                value={text} onChangeText={setText} multiline maxLength={2000}
+                autoCorrect={false} spellCheck={false} />
               <TouchableOpacity style={[styles.sendBtn, (!text.trim() || sending) && styles.sendBtnDisabled]}
                 onPress={() => sendMessage()} disabled={!text.trim() || sending}>
                 {sending ? <Spinner /> : <Text style={styles.sendBtnText}>SEND</Text>}
@@ -2240,7 +2228,7 @@ function GroupsTab({ token, onOpenGroup, unread = {} }) {
   const deleteGroup = (g) => {
     Alert.alert(
       'DELETE GROUP',
-      `Delete "${g.name}"? This cannot be undone.`,
+      `Delete "${g.name}" for everyone? This cannot be undone.`,
       [
         { text: 'CANCEL', style: 'cancel' },
         {
@@ -2249,6 +2237,26 @@ function GroupsTab({ token, onOpenGroup, unread = {} }) {
           onPress: async () => {
             try {
               await api(`/api/groups/${g.id}`, 'DELETE', null, token);
+              setGroups(prev => prev.filter(x => x.id !== g.id));
+            } catch (e) { setErr(e.message); }
+          },
+        },
+      ]
+    );
+  };
+
+  const leaveGroup = (g) => {
+    Alert.alert(
+      'LEAVE GROUP',
+      `Leave "${g.name}"?`,
+      [
+        { text: 'CANCEL', style: 'cancel' },
+        {
+          text: 'LEAVE',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await api(`/api/groups/${g.id}/leave`, 'POST', null, token);
               setGroups(prev => prev.filter(x => x.id !== g.id));
             } catch (e) { setErr(e.message); }
           },
@@ -2280,6 +2288,7 @@ function GroupsTab({ token, onOpenGroup, unread = {} }) {
       )}
       <FlatList
         data={groups} keyExtractor={(g) => String(g.id)}
+        extraData={groups}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchGroups(true)} tintColor={C.accent} />}
         ListHeaderComponent={!showForm ? (
           <TouchableOpacity style={styles.createGroupBtn} onPress={() => setShowForm(true)}>
@@ -2289,29 +2298,31 @@ function GroupsTab({ token, onOpenGroup, unread = {} }) {
         ListEmptyComponent={<Text style={styles.emptyText}>NO GROUPS YET</Text>}
         renderItem={({ item }) => {
           const cnt = unread[`group_${item.id}`] || 0;
-          const row = (
-            <TouchableOpacity style={styles.userRow} onPress={() => onOpenGroup(item)}>
-              <View style={[styles.userRowInfo, { flex: 1 }]}>
-                <Text style={styles.userRowName}>{item.name}</Text>
-                {item.description
-                  ? <Text style={styles.userRowMeta} numberOfLines={1}>{item.description}</Text>
-                  : <Text style={styles.userRowMeta}>CREATED {fmtDate(item.created_at)}</Text>
-                }
-              </View>
-              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                {cnt > 0 && (
-                  <View style={styles.rowBadge}>
-                    <Text style={styles.rowBadgeText}>{cnt > 99 ? '99+' : cnt}</Text>
-                  </View>
-                )}
-                <Text style={styles.chevron}>{'>'}</Text>
-              </View>
-            </TouchableOpacity>
-          );
-          if (item.my_role !== 'admin') return row;
+          const isAdmin = item.my_role === 'admin';
           return (
-            <SwipeableRow rightLabel="DELETE" onAction={() => deleteGroup(item)}>
-              {row}
+            <SwipeableRow
+              key={`grp-${item.id}`}
+              rightLabel={isAdmin ? 'DELETE' : 'LEAVE'}
+              rightColor={isAdmin ? C.red : C.amber}
+              onAction={() => isAdmin ? deleteGroup(item) : leaveGroup(item)}
+            >
+              <TouchableOpacity style={styles.userRow} onPress={() => onOpenGroup(item)}>
+                <View style={[styles.userRowInfo, { flex: 1 }]}>
+                  <Text style={styles.userRowName}>{item.name}</Text>
+                  {item.description
+                    ? <Text style={styles.userRowMeta} numberOfLines={1}>{item.description}</Text>
+                    : <Text style={styles.userRowMeta}>CREATED {fmtDate(item.created_at)}</Text>
+                  }
+                </View>
+                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                  {cnt > 0 && (
+                    <View style={styles.rowBadge}>
+                      <Text style={styles.rowBadgeText}>{cnt > 99 ? '99+' : cnt}</Text>
+                    </View>
+                  )}
+                  <Text style={styles.chevron}>{'>'}</Text>
+                </View>
+              </TouchableOpacity>
             </SwipeableRow>
           );
         }}
@@ -2533,7 +2544,8 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
                 <IconPin size={18} color={C.accent} />
               </TouchableOpacity>
               <TextInput style={styles.chatInput} placeholder="MESSAGE..." placeholderTextColor={C.muted}
-                value={text} onChangeText={setText} multiline maxLength={2000} />
+                value={text} onChangeText={setText} multiline maxLength={2000}
+                autoCorrect={false} spellCheck={false} />
               <TouchableOpacity style={[styles.sendBtn, (!text.trim() || sending) && styles.sendBtnDisabled]}
                 onPress={() => sendMessage()} disabled={!text.trim() || sending}>
                 {sending ? <Spinner /> : <Text style={styles.sendBtnText}>SEND</Text>}
@@ -3123,10 +3135,8 @@ function ProfileTab({ token, currentUser, onLogout }) {
 function ContactsTab({ token, currentUser, onOpenDM }) {
   const { styles, C } = useSkin();
   // contacts  → array of { contactId, userId, username, displayName, online, since }
-  // pending   → { received: [{contactId, userId, username, displayName}], sent: [...] }
-  // users     → array of { id, username, displayName, online, isMe, contactStatus }
+  // users     → array of { id, username, displayName, online, isMe }
   const [contacts,       setContacts]       = useState([]);
-  const [pending,        setPending]        = useState({ received: [], sent: [] });
   const [users,          setUsers]          = useState([]);
   const [loading,        setLoading]        = useState(true);
   const [refreshing,     setRefreshing]     = useState(false);
@@ -3134,7 +3144,7 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
   const [showSearch,     setShowSearch]     = useState(false);
   const [query,          setQuery]          = useState('');
   const [actioning,      setActioning]      = useState({});
-  // SMS invite
+  // Phone contacts modal
   const [showInvite,     setShowInvite]     = useState(false);
   const [deviceContacts, setDeviceContacts] = useState([]);
   const [contactsLoading,setContactsLoading]= useState(false);
@@ -3145,14 +3155,11 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
     if (isRefresh) setRefreshing(true); else setLoading(true);
     setErr('');
     try {
-      const [c, p, u] = await Promise.all([
-        api('/api/contacts',         'GET', null, token),
-        api('/api/contacts/pending', 'GET', null, token),
-        api('/api/users',            'GET', null, token),
+      const [c, u] = await Promise.all([
+        api('/api/contacts', 'GET', null, token),
+        api('/api/users',    'GET', null, token),
       ]);
       setContacts(Array.isArray(c) ? c : []);
-      // pending is { received: [...], sent: [...] } — never an array
-      setPending({ received: p?.received ?? [], sent: p?.sent ?? [] });
       setUsers(Array.isArray(u) ? u.filter(u2 => !u2.isMe) : []);
     } catch (e) { setErr(e.message); }
     finally { setLoading(false); setRefreshing(false); }
@@ -3162,22 +3169,14 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
 
   const act = async (key, fn) => {
     setActioning(a => ({ ...a, [key]: true }));
-    // Use isRefresh=true so the pull-to-refresh indicator shows instead of
-    // replacing the entire UI with a full-screen spinner while data reloads.
     try { await fn(); await fetchAll(true); } catch (e) { setErr(e.message); }
     finally { setActioning(a => ({ ...a, [key]: false })); }
   };
 
-  // API uses camelCase keys
-  const sendRequest = (userId) => act(`req_${userId}`, async () => {
-    const res = await api('/api/contacts/request', 'POST', { userId }, token);
-    // Backend returns {status:'already_contacts'} if already connected
-    if (!res?.status || res.status !== 'already_contacts') {
-      Alert.alert('REQUEST SENT', 'Contact request sent. They will need to accept before you can chat.');
-    }
+  // Instant add — no approval needed, contacts immediately mutual
+  const addContact = (userId) => act(`add_${userId}`, async () => {
+    await api('/api/contacts/request', 'POST', { userId }, token);
   });
-  const acceptRequest  = (contactId) => act(`acc_${contactId}`, () => api('/api/contacts/accept',  'POST', { contactId }, token));
-  const declineRequest = (contactId) => act(`dec_${contactId}`, () => api('/api/contacts/decline', 'POST', { contactId }, token));
 
   const blockUser = (c) => {
     Alert.alert(
@@ -3266,28 +3265,30 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
     }
   };
 
-  // Find app users whose username/displayName contains the contact's name words
-  const findOnApp = (contact) => {
+  // Find and instantly add app users matching this phone contact's name
+  const findOnApp = async (contact) => {
     const words = contact.name.toLowerCase().split(/\s+/).filter(w => w.length > 1);
     const matches = users.filter(u =>
+      !contactUserIds.has(u.id) &&
       words.some(w =>
         (u.username || '').toLowerCase().includes(w) ||
         (u.displayName || '').toLowerCase().includes(w)
       )
     );
     if (matches.length === 0) {
-      Alert.alert('NOT FOUND', `No nano-SYNAPSYS users found matching "${contact.name}".\n\nSend them an SMS invite to join.`);
-    } else {
+      Alert.alert('NOT ON APP', `No users found matching "${contact.name}".\n\nSend them an SMS invite to join.`);
+    } else if (matches.length === 1) {
       setShowInvite(false);
-      setQuery(contact.name.split(' ')[0]); // pre-fill search
+      await addContact(matches[0].id);
+    } else {
+      // Multiple matches — show in search
+      setShowInvite(false);
+      setQuery(contact.name.split(' ')[0]);
       setShowSearch(true);
     }
   };
 
-  // Correct field names from API responses
   const contactUserIds = new Set(contacts.map(c => c.userId));
-  const pendingFromIds = new Set(pending.received.map(p => p.userId));
-  const pendingSentIds = new Set(pending.sent.map(p => p.userId));
 
   const filteredUsers = query.trim()
     ? users.filter(u => (u.username + (u.displayName || '')).toLowerCase().includes(query.toLowerCase()))
@@ -3301,48 +3302,6 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchAll(true)} tintColor={C.accent} />}
     >
       <ErrText msg={err} />
-
-      {/* ── INCOMING REQUESTS ──────────────────────────────────── */}
-      {pending.received.length > 0 && (
-        <>
-          <View style={{ paddingHorizontal: 16, paddingTop: 14, paddingBottom: 4, flexDirection: 'row', alignItems: 'center' }}>
-            <Text style={styles.contactSection}>PENDING REQUESTS</Text>
-            <View style={styles.pendingBadge}>
-              <Text style={styles.pendingBadgeText}>{pending.received.length}</Text>
-            </View>
-          </View>
-          {pending.received.map(p => (
-            <View key={p.contactId} style={[styles.contactRow, { borderLeftWidth: 3, borderLeftColor: C.amber }]}>
-              <View style={styles.contactRowLeft}>
-                <View style={styles.contactRowInfo}>
-                  <Text style={styles.contactRowName}>{p.displayName || p.username}</Text>
-                  <Text style={styles.contactRowMeta}>WANTS TO CONNECT</Text>
-                </View>
-              </View>
-              <View style={styles.contactBtnRow}>
-                <TouchableOpacity
-                  style={styles.contactActionBtn}
-                  onPress={() => acceptRequest(p.contactId)}
-                  disabled={!!actioning[`acc_${p.contactId}`]}
-                >
-                  {actioning[`acc_${p.contactId}`]
-                    ? <Spinner />
-                    : <Text style={styles.contactActionBtnText}>{'\u2713'} OK</Text>
-                  }
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.contactActionBtn, styles.contactRejectBtn]}
-                  onPress={() => declineRequest(p.contactId)}
-                  disabled={!!actioning[`dec_${p.contactId}`]}
-                >
-                  <Text style={[styles.contactActionBtnText, styles.contactRejectBtnText]}>{'\u2715'}</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          ))}
-          <View style={styles.separator} />
-        </>
-      )}
 
       {/* ── MY CONTACTS ────────────────────────────────────────── */}
       <View style={{ paddingHorizontal: 16, paddingTop: 14, paddingBottom: 4 }}>
@@ -3391,10 +3350,8 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
             />
           </View>
           {filteredUsers.map(u => {
-            const isContact   = contactUserIds.has(u.id);
-            const sentPending = pendingSentIds.has(u.id);
-            const recvPending = pendingFromIds.has(u.id);
-            const key = `req_${u.id}`;
+            const isContact = contactUserIds.has(u.id);
+            const key = `add_${u.id}`;
             return (
               <View key={u.id} style={styles.contactRow}>
                 <View style={styles.contactRowLeft}>
@@ -3405,15 +3362,13 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
                   </View>
                 </View>
                 {isContact ? (
-                  <Text style={[styles.contactActionBtnText, { color: C.green }]}>{'\u2713'} CONTACT</Text>
-                ) : sentPending ? (
-                  <Text style={[styles.contactActionBtnText, { color: C.amber }]}>PENDING</Text>
-                ) : recvPending ? (
-                  <Text style={[styles.contactActionBtnText, { color: C.amber }]}>RESPOND ABOVE</Text>
+                  <TouchableOpacity onPress={() => onOpenDM({ id: u.id, username: u.username, display_name: u.displayName })}>
+                    <Text style={[styles.contactActionBtnText, { color: C.green }]}>{'\u2713'} MESSAGE</Text>
+                  </TouchableOpacity>
                 ) : (
                   <TouchableOpacity
                     style={styles.contactActionBtn}
-                    onPress={() => sendRequest(u.id)}
+                    onPress={() => addContact(u.id)}
                     disabled={!!actioning[key]}
                   >
                     {actioning[key] ? <Spinner /> : <Text style={styles.contactActionBtnText}>+ ADD</Text>}
