@@ -1646,8 +1646,9 @@ function BiometricUnlockScreen({ onUnlock, onUsePassword }) {
 // ---------------------------------------------------------------------------
 // AUTH SCREEN
 // ---------------------------------------------------------------------------
-function AuthScreen({ onAuth }) {
+function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
   const { styles, C } = useSkin();
+  const mono = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
   const [tab, setTab]                 = useState('LOGIN');
   const [username, setUsername]       = useState('');
   const [email, setEmail]             = useState('');
@@ -1667,6 +1668,11 @@ function AuthScreen({ onAuth }) {
       setBioReady(supported && enabled && !!creds);
     })();
   }, []);
+
+  // Auto-switch to register tab when arriving via an invite link
+  useEffect(() => {
+    if (inviteToken && inviterName) setTab('REGISTER');
+  }, [inviteToken, inviterName]);
 
   const reset = () => { setUsername(''); setEmail(''); setPassword(''); setErr(''); };
   const handleTabSwitch = (t) => { setTab(t); reset(); };
@@ -1721,7 +1727,9 @@ function AuthScreen({ onAuth }) {
     if (!username.trim() || !email.trim() || !password.trim()) { setErr('Username, email and password are required.'); return; }
     setLoading(true); setErr('');
     try {
-      const data = await api('/auth/register', 'POST', { username: username.trim(), email: email.trim(), password });
+      const body = { username: username.trim(), email: email.trim(), password };
+      if (inviteToken) body.invite_token = inviteToken; // auto-connects inviter as contact
+      const data = await api('/auth/register', 'POST', body);
       await saveToken(data.token); await saveUser(data.user);
       onAuth(data.token, data.user);
     } catch (e) { setErr(e.message); }
@@ -1737,6 +1745,23 @@ function AuthScreen({ onAuth }) {
             <Text style={styles.logoText}>nano-SYNAPSYS</Text>
             <Text style={styles.logoSub}>AI EVOLUTION SECURE MESH</Text>
           </View>
+
+          {/* Invite banner — shown when user arrives via nanosynapsys://join/TOKEN */}
+          {inviteToken && inviterName && (
+            <View style={{
+              backgroundColor: '#00FF4115', borderWidth: 1, borderColor: '#00FF4140',
+              borderRadius: 6, padding: 12, marginBottom: 16, marginHorizontal: 4,
+              alignItems: 'center',
+            }}>
+              <Text style={{ fontFamily: mono, fontSize: 11, color: '#00FF41', fontWeight: '700', letterSpacing: 1.5 }}>
+                {'\u2713'} INVITED BY {inviterName.toUpperCase()}
+              </Text>
+              <Text style={{ fontFamily: mono, fontSize: 10, color: '#00c832', marginTop: 4, letterSpacing: 0.5 }}>
+                Register below — you'll be connected instantly
+              </Text>
+            </View>
+          )}
+
           <View style={styles.authTabRow}>
             {['LOGIN', 'REGISTER'].map((t) => (
               <TouchableOpacity key={t} style={[styles.authTab, tab === t && styles.authTabActive]} onPress={() => handleTabSwitch(t)}>
@@ -2967,13 +2992,6 @@ function ProfileTab({ token, currentUser, onLogout }) {
         <Text style={styles.profileLabel}>EMAIL</Text>
         <Text style={styles.profileValue}>{currentUser.email || '—'}</Text>
       </View>
-      <View style={styles.profileCard}>
-        <Text style={styles.profileLabel}>ACCOUNT STATUS</Text>
-        <Text style={[styles.profileValue, { color: currentUser.is_approved ? C.green : C.amber }]}>
-          {currentUser.is_approved ? 'APPROVED' : 'PENDING APPROVAL'}
-        </Text>
-      </View>
-
       <View style={styles.profileDivider} />
 
       {/* ── EDIT PROFILE ────────────────────────────────────────────── */}
@@ -3243,8 +3261,13 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
         return;
       }
       const senderName = currentUser?.display_name || currentUser?.username || 'A friend';
-      const msg =
-        `${senderName} invited you to nano-SYNAPSYS — private encrypted messaging by AI Evolution. Join here: ${inviteUrl} (expires in 7 days, one-use only)`;
+      // Extract the token from the invite URL so we can embed the deep link
+      const tokenMatch = inviteUrl.match(/[?&]invite=([A-Za-z0-9_=-]+)/);
+      const inviteToken = tokenMatch ? tokenMatch[1] : null;
+      const deepLink = inviteToken ? `nanosynapsys://join/${inviteToken}` : null;
+      const msg = deepLink
+        ? `${senderName} invited you to nano-SYNAPSYS — private encrypted messaging.\n\n1. Download the app: https://apps.apple.com/app/id6759710350\n2. Open this link to join: ${deepLink}\n\nOr register at: ${inviteUrl}\n(One-use invite, expires in 7 days)`
+        : `${senderName} invited you to nano-SYNAPSYS — private encrypted messaging by AI Evolution. Join here: ${inviteUrl} (expires in 7 days, one-use only)`;
 
       // Normalize phone number — strip whitespace/formatting
       const phone = (contact.phone || '').replace(/\s+/g, '');
@@ -3270,23 +3293,40 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
     }
   };
 
-  // Find app users by phone contact name — queries the search endpoint directly
+  // Find a phone contact on the app — if not found, offer SMS invite automatically
   const findOnApp = async (contact) => {
-    const q = contact.name.split(' ')[0]; // search by first name
+    const q = contact.name.split(' ')[0];
     if (q.length < 2) {
-      Alert.alert('NOT ON APP', `Cannot search for "${contact.name}" — name too short.`);
+      // Name too short to search — skip to invite
+      Alert.alert(
+        'INVITE TO APP',
+        `"${contact.name}" is not on nano-SYNAPSYS yet.\n\nSend them an invite link via SMS?`,
+        [
+          { text: 'CANCEL', style: 'cancel' },
+          { text: 'SEND INVITE', onPress: () => sendSMSInvite(contact) },
+        ],
+      );
       return;
     }
     try {
       const data = await api(`/api/users/search?q=${encodeURIComponent(q)}`, 'GET', null, token);
       const matches = Array.isArray(data) ? data.filter(u => !contactUserIds.has(u.id)) : [];
       if (matches.length === 0) {
-        Alert.alert('NOT ON APP', `No users found matching "${contact.name}".\n\nSend them an SMS invite to join.`);
+        // Not on app — offer to send invite directly
+        Alert.alert(
+          'NOT ON APP YET',
+          `"${contact.name}" doesn't have nano-SYNAPSYS.\n\nSend them an invite? They'll be added to your contacts automatically when they join.`,
+          [
+            { text: 'CANCEL', style: 'cancel' },
+            { text: 'SEND INVITE', onPress: () => sendSMSInvite(contact) },
+          ],
+        );
       } else if (matches.length === 1) {
         setShowInvite(false);
         await addContact(matches[0].id);
+        Alert.alert('\u2713 ADDED', `${matches[0].displayName || matches[0].username} is now in your contacts.`);
       } else {
-        // Multiple matches — open search panel pre-filled
+        // Multiple matches — open search panel pre-filled so user picks the right one
         setShowInvite(false);
         setQuery(q);
         setShowSearch(true);
@@ -3474,39 +3514,10 @@ function SettingsTab({ token, currentUser, notifEnabled, onSetNotifEnabled }) {
   const [locLoading, setLocLoading]    = useState(false);
   const [locErr,     setLocErr]        = useState('');
 
-  // ── Admin state ───────────────────────────────────────────────────────
-  const isAdmin = currentUser?.is_staff || currentUser?.is_superuser;
-  const [pendingUsers,   setPendingUsers]   = useState([]);
-  const [adminLoading,   setAdminLoading]   = useState(false);
-  const [adminRefreshing,setAdminRefreshing]= useState(false);
-  const [adminErr,       setAdminErr]       = useState('');
-  const [adminActioning, setAdminActioning] = useState({});
-
-  const fetchPending = useCallback(async (isRefresh = false) => {
-    if (!isAdmin) return;
-    if (isRefresh) setAdminRefreshing(true); else setAdminLoading(true);
-    setAdminErr('');
-    try {
-      const data = await api('/api/admin/pending', 'GET', null, token);
-      setPendingUsers(Array.isArray(data) ? data : []);
-    } catch (e) { setAdminErr(e.message); }
-    finally { setAdminLoading(false); setAdminRefreshing(false); }
-  }, [isAdmin, token]);
-
-  const adminAction = async (key, path, userId) => {
-    setAdminActioning(a => ({ ...a, [key]: true }));
-    try {
-      await api(path, 'POST', {}, token);
-      setPendingUsers(prev => prev.filter(u => u.id !== userId));
-    } catch (e) { setAdminErr(e.message); }
-    finally { setAdminActioning(a => ({ ...a, [key]: false })); }
-  };
-
   useEffect(() => {
     loadDisappear().then(v => setDisappearState(v));
     loadLocation().then(v => { if (v) setLocationState(v); });
-    fetchPending();
-  }, [fetchPending]);
+  }, []);
 
   const handleSetDisappear = async (v) => {
     setDisappearState(v);
@@ -3648,75 +3659,6 @@ function SettingsTab({ token, currentUser, notifEnabled, onSetNotifEnabled }) {
 
       <View style={styles.profileDivider} />
 
-      {/* ── ADMIN PANEL (staff only) ─────────────────────────── */}
-      {isAdmin && (
-        <>
-          <Text style={[styles.settingsHeader, { color: C.amber }]}>ADMIN — PENDING APPROVALS</Text>
-          {adminErr ? <ErrText msg={adminErr} /> : null}
-
-          {adminLoading ? (
-            <View style={{ paddingVertical: 20, alignItems: 'center' }}><Spinner /></View>
-          ) : pendingUsers.length === 0 ? (
-            <Text style={[styles.emptyText, { marginTop: 0, marginBottom: 16, fontSize: 11 }]}>
-              {'\u2713'} NO PENDING REGISTRATIONS
-            </Text>
-          ) : (
-            pendingUsers.map(u => (
-              <View key={u.id} style={styles.adminCard}>
-                <Text style={styles.adminCardLabel}>PENDING REGISTRATION</Text>
-                <Text style={styles.adminCardName}>{u.username}</Text>
-                <Text style={styles.adminCardEmail}>{u.email}</Text>
-                {u.join_reason ? (
-                  <Text style={styles.adminCardReason}>"{u.join_reason}"</Text>
-                ) : null}
-                {u.ip_address ? (
-                  <Text style={styles.adminCardEmail}>IP: {u.ip_address}</Text>
-                ) : null}
-                <Text style={styles.adminCardEmail}>
-                  {new Date(u.created_at).toLocaleString()}
-                </Text>
-                <View style={styles.adminBtnRow}>
-                  <TouchableOpacity
-                    style={[styles.adminApproveBtn, adminActioning[`app_${u.id}`] && { opacity: 0.5 }]}
-                    onPress={() => adminAction(`app_${u.id}`, `/api/admin/approve/${u.id}`, u.id)}
-                    disabled={!!adminActioning[`app_${u.id}`] || !!adminActioning[`rej_${u.id}`]}
-                  >
-                    {adminActioning[`app_${u.id}`]
-                      ? <Spinner />
-                      : <Text style={styles.adminApproveBtnText}>{'\u2713'} APPROVE</Text>
-                    }
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.adminRejectBtn, adminActioning[`rej_${u.id}`] && { opacity: 0.5 }]}
-                    onPress={() => adminAction(`rej_${u.id}`, `/api/admin/reject/${u.id}`, u.id)}
-                    disabled={!!adminActioning[`app_${u.id}`] || !!adminActioning[`rej_${u.id}`]}
-                  >
-                    {adminActioning[`rej_${u.id}`]
-                      ? <Spinner />
-                      : <Text style={styles.adminRejectBtnText}>{'\u2715'} REJECT</Text>
-                    }
-                  </TouchableOpacity>
-                </View>
-              </View>
-            ))
-          )}
-
-          <TouchableOpacity
-            style={[styles.ghostBtn, { marginBottom: 4 }, adminRefreshing && { opacity: 0.5 }]}
-            onPress={() => fetchPending(true)}
-            disabled={adminRefreshing || adminLoading}
-          >
-            {adminRefreshing ? <Spinner /> : (
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                <IconRefresh size={13} color={C.dim} />
-                <Text style={styles.ghostBtnText}>REFRESH LIST</Text>
-              </View>
-            )}
-          </TouchableOpacity>
-
-          <View style={styles.profileDivider} />
-        </>
-      )}
 
       {/* ── APP INFO ─────────────────────────────────────────── */}
       <Text style={styles.settingsHeader}>APP INFO</Text>
@@ -3923,9 +3865,34 @@ function HomeScreen({ token, currentUser, onLogout }) {
 // ---------------------------------------------------------------------------
 function AppInner() {
   const { styles, C } = useSkin();
-  const [appState, setAppState] = useState('loading');
-  const [token, setToken]       = useState(null);
-  const [currentUser, setUser]  = useState(null);
+  const [appState,    setAppState]    = useState('loading');
+  const [token,       setToken]       = useState(null);
+  const [currentUser, setUser]        = useState(null);
+  // Invite deep-link state: set when app opens via nanosynapsys://join/{token}
+  const [inviteToken, setInviteToken] = useState(null);
+  const [inviterName, setInviterName] = useState(null);
+
+  // Handle nanosynapsys://join/{token} deep links
+  useEffect(() => {
+    const handleURL = async (url) => {
+      if (!url) return;
+      const match = url.match(/nanosynapsys:\/\/join\/([A-Za-z0-9_=-]+)/);
+      if (!match) return;
+      const tkn = match[1];
+      try {
+        const data = await api(`/api/invites/validate/${tkn}`, 'GET', null, null);
+        if (data?.valid) {
+          setInviteToken(tkn);
+          setInviterName(data.created_by);
+          // Only redirect to auth if not already logged in
+          setAppState(prev => (prev === 'home' || prev === 'biometric') ? prev : 'auth');
+        }
+      } catch {}
+    };
+    Linking.getInitialURL().then(url => { if (url) handleURL(url); });
+    const sub = Linking.addEventListener('url', e => handleURL(e.url));
+    return () => sub?.remove();
+  }, []);
 
   useEffect(() => {
     registerForNotifications().catch(() => {});
@@ -3948,7 +3915,12 @@ function AppInner() {
     })();
   }, []);
 
-  const handleAuth = useCallback((t, u) => { setToken(t); setUser(u); setAppState('home'); }, []);
+  const handleAuth = useCallback((t, u) => {
+    setToken(t); setUser(u);
+    // Clear invite state once registration/login is complete
+    setInviteToken(null); setInviterName(null);
+    setAppState('home');
+  }, []);
   const handleLogout = useCallback(async () => {
     await clearToken(); await clearUser();
     // Clear all in-memory E2EE state so it cannot leak to the next session.
@@ -3978,7 +3950,9 @@ function AppInner() {
     );
   }
 
-  if (appState === 'auth') return <AuthScreen onAuth={handleAuth} />;
+  if (appState === 'auth') {
+    return <AuthScreen onAuth={handleAuth} inviteToken={inviteToken} inviterName={inviterName} />;
+  }
 
   return <HomeScreen token={token} currentUser={currentUser} onLogout={handleLogout} />;
 }
