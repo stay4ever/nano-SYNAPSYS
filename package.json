@@ -6,8 +6,7 @@
     "start": "expo start",
     "ios": "expo run:ios",
     "android": "expo run:android",
-    "build:ios": "eas build --platform ios",
-    "submit:ios": "eas submit --platform ios"
+    "testflight": "eas submit --platform ios"
   },
   "dependencies": {
     "expo": "~54.0.0",
