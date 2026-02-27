@@ -14,7 +14,7 @@
     },
     "ios": {
       "bundleIdentifier": "com.aievolution.nanosynapsys",
-      "buildNumber": "3",
+      "buildNumber": "9",
       "supportsTablet": false,
       "icon": "./assets/icon.png",
       "infoPlist": {
@@ -25,7 +25,7 @@
         "NSLocationWhenInUseUsageDescription": "nano-SYNAPSYS uses your location to attach GPS coordinates to your profile.",
         "NSCalendarsFullAccessUsageDescription": "nano-SYNAPSYS reads your calendar so Banner AI can see your schedule and create events.",
         "NSRemindersFullAccessUsageDescription": "nano-SYNAPSYS reads your reminders so Banner AI can help manage your tasks.",
-        "ITSAppUsesNonExemptEncryption": true
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
