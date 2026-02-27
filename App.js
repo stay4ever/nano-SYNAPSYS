@@ -1787,20 +1787,25 @@ function AuthScreen({ onAuth }) {
 // SWIPEABLE ROW  (pure Animated + PanResponder — no extra packages)
 // Swipe left to reveal a destructive action button. Swipe right to close.
 // ---------------------------------------------------------------------------
-const _SWIPE_W = 88; // width of the revealed action button
+const _SWIPE_W = 88;      // px: width of the revealed action button
+const _FULL_SWIPE = 160;  // px: drag past this → fly off + trigger action immediately
 
 function SwipeableRow({ children, rightLabel = 'DELETE', rightColor, onAction, disabled = false }) {
   const { C } = useSkin();
   const mono  = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
   const color = rightColor || C.red;
 
-  // Single Animated.Value tracks the row's X position (0 = closed, -_SWIPE_W = open).
-  // We never use setOffset/flattenOffset — those cause jumps when a new gesture starts
-  // mid-animation. Instead we capture the real position via stopAnimation() at grant time.
   const position  = useRef(new Animated.Value(0)).current;
-  const dragStart = useRef(0); // actual position when the finger goes down
+  const dragStart = useRef(0);
+  const fired     = useRef(false); // prevent double-fire on full swipe
 
-  const snapTo = useCallback((toValue) => {
+  // R.current holds always-fresh copies of props/helpers so PanResponder
+  // (created once) never calls stale closures.
+  const R = useRef({});
+  R.current.onAction = onAction;
+  R.current.disabled = disabled;
+
+  R.current.snapTo = (toValue) => {
     Animated.spring(position, {
       toValue,
       useNativeDriver: true,
@@ -1808,40 +1813,52 @@ function SwipeableRow({ children, rightLabel = 'DELETE', rightColor, onAction, d
       friction: 12,
       overshootClamping: true,
     }).start();
-  }, [position]);
+  };
+
+  // Fly the row off-screen to the left, then fire onAction.
+  R.current.slideOff = () => {
+    if (fired.current) return;
+    fired.current = true;
+    Animated.timing(position, {
+      toValue: -500,
+      duration: 220,
+      useNativeDriver: true,
+    }).start(() => R.current.onAction && R.current.onAction());
+  };
 
   const pan = useRef(PanResponder.create({
-    // Only claim clearly horizontal gestures so vertical list scroll is unaffected
     onStartShouldSetPanResponder: () => false,
+    // Claim horizontal gestures; let vertical scroll through unimpeded
     onMoveShouldSetPanResponder: (_, { dx, dy }) =>
-      !disabled && Math.abs(dx) > 5 && Math.abs(dx) > Math.abs(dy) * 1.5,
+      !R.current.disabled && Math.abs(dx) > 6 && Math.abs(dx) > Math.abs(dy) * 1.8,
 
     onPanResponderGrant: () => {
-      // Stop any running snap animation and read the exact current pixel position
+      fired.current = false;
       position.stopAnimation((val) => { dragStart.current = val; });
     },
 
     onPanResponderMove: (_, { dx }) => {
-      position.setValue(Math.max(-_SWIPE_W, Math.min(0, dragStart.current + dx)));
+      // Allow dragging further than _SWIPE_W so a full swipe feels natural
+      position.setValue(Math.min(0, dragStart.current + dx));
     },
 
     onPanResponderRelease: (_, { dx, vx }) => {
-      const cur = Math.max(-_SWIPE_W, Math.min(0, dragStart.current + dx));
-      // Fast leftward flick OR crossed the halfway mark → open; otherwise close
-      if (vx < -0.3 || cur < -(_SWIPE_W / 2)) {
-        snapTo(-_SWIPE_W);
+      const cur = Math.min(0, dragStart.current + dx);
+      if (vx < -0.5 || cur < -_FULL_SWIPE) {
+        // Hard/fast swipe → fly off and fire action immediately
+        R.current.slideOff();
+      } else if (vx < -0.3 || cur < -(_SWIPE_W / 2)) {
+        // Medium swipe → reveal the button
+        R.current.snapTo(-_SWIPE_W);
       } else {
-        snapTo(0);
+        R.current.snapTo(0);
       }
     },
 
-    onPanResponderTerminate: () => snapTo(0),
+    onPanResponderTerminate: () => {
+      if (!fired.current) R.current.snapTo(0);
+    },
   })).current;
-
-  const handleAction = () => {
-    snapTo(0);
-    onAction && onAction();
-  };
 
   return (
     <View style={{ overflow: 'hidden' }}>
@@ -1852,7 +1869,7 @@ function SwipeableRow({ children, rightLabel = 'DELETE', rightColor, onAction, d
         justifyContent: 'center', alignItems: 'center',
       }}>
         <TouchableOpacity
-          onPress={handleAction}
+          onPress={() => { R.current.snapTo(0); R.current.onAction && R.current.onAction(); }}
           style={{ flex: 1, width: '100%', justifyContent: 'center', alignItems: 'center' }}
         >
           <Text style={{ fontFamily: mono, fontSize: 11, color: '#fff', fontWeight: '700', letterSpacing: 1 }}>
@@ -1891,25 +1908,16 @@ function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
 
   useEffect(() => { fetchUsers(); }, [fetchUsers]);
 
-  const deleteChat = (user) => {
-    Alert.alert(
-      'CLEAR CONVERSATION',
-      `Delete all messages with ${user.displayName || user.username}?`,
-      [
-        { text: 'CANCEL', style: 'cancel' },
-        {
-          text: 'DELETE',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await api(`/api/messages/delete/${user.id}`, 'DELETE', null, token);
-              setUsers(prev => prev.filter(u => u.id !== user.id));
-            } catch (e) { setErr(e.message); }
-          },
-        },
-      ]
-    );
-  };
+  const deleteChat = useCallback(async (user) => {
+    // Optimistic removal — row already flew off screen via SwipeableRow.slideOff
+    setUsers(prev => prev.filter(u => u.id !== user.id));
+    try {
+      await api(`/api/messages/delete/${user.id}`, 'DELETE', null, token);
+    } catch (e) {
+      setErr(e.message);
+      fetchUsers(); // restore list on failure
+    }
+  }, [token, fetchUsers]);
 
   if (loading) return <View style={styles.centerFill}><Spinner size="large" /></View>;
 
@@ -2561,7 +2569,7 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
 // ---------------------------------------------------------------------------
 // BOT TAB
 // ---------------------------------------------------------------------------
-function BotTab({ token, wsRef, currentUser }) {
+function BotTab({ token, wsRef }) {
   const { styles, C } = useSkin();
   const mono = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
   const [messages, setMessages] = useState([{
@@ -2578,7 +2586,8 @@ function BotTab({ token, wsRef, currentUser }) {
   const [bpSend,        setBpSend]        = useState(false);
   const [bpCal,         setBpCal]         = useState(false);
   const [pendingAction, setPendingAction] = useState(null);
-  const [users,         setUsers]         = useState([]);
+  // contacts list: fetched when bpSend is on so executeAction can look up IDs
+  const [contacts,      setContacts]      = useState([]);
   const listRef     = useRef(null);
   const typingTimer = useRef(null);
 
@@ -2595,57 +2604,38 @@ function BotTab({ token, wsRef, currentUser }) {
     })();
   }, []);
 
-  // Fetch user list whenever messaging/send permissions are active
+  // Fetch contacts when send permission is active (needed for executeAction to resolve IDs)
   useEffect(() => {
-    if (!bpSend && !bpMsgs) return;
-    api('/api/users', 'GET', null, token)
-      .then(data => { if (Array.isArray(data)) setUsers(data.filter(u => !u.isMe)); })
+    if (!bpSend) return;
+    api('/api/contacts', 'GET', null, token)
+      .then(data => { if (Array.isArray(data)) setContacts(data); })
       .catch(() => {});
-  }, [bpSend, bpMsgs, token]);
+  }, [bpSend, token]);
 
   useEffect(() => { return () => { if (typingTimer.current) clearTimeout(typingTimer.current); }; }, []);
 
-  /** Build enriched context string from enabled permissions. */
-  const buildContext = async () => {
-    const parts = [];
-    if (bpMsgs && users.length > 0) {
-      try {
-        const convos = await Promise.all(
-          users.slice(0, 5).map(async u => {
-            try {
-              const msgs = await api(`/api/messages/${u.id}`, 'GET', null, token);
-              const recent = Array.isArray(msgs) ? msgs.slice(-3) : [];
-              if (!recent.length) return null;
-              return `${u.displayName || u.username}:\n` + recent.map(m => {
-                const mine = String(m.from_user?.id ?? m.from_user) === String(currentUser?.id);
-                const body  = isEncryptedDM(m.content) ? '[encrypted]' : (m.content || '').slice(0, 120);
-                return `  ${mine ? 'Me' : (u.displayName || u.username)}: ${body}`;
-              }).join('\n');
-            } catch { return null; }
-          })
-        );
-        const digest = convos.filter(Boolean).join('\n\n');
-        if (digest) parts.push(`RECENT CONVERSATIONS:\n${digest}`);
-      } catch {}
-    }
-    if (bpCal) {
-      try {
-        const { status } = await Calendar.requestCalendarPermissionsAsync();
-        if (status === 'granted') {
-          const now  = new Date();
-          const in7d = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-          const cals = await Calendar.getCalendarsAsync(Calendar.EntityTypes.EVENT);
-          const evts = await Calendar.getEventsAsync(cals.map(c => c.id), now, in7d);
-          if (evts.length) {
-            const list = evts.slice(0, 20).map(e =>
-              `  - ${e.title}: ${new Date(e.startDate).toLocaleString()}`
-            ).join('\n');
-            parts.push(`UPCOMING CALENDAR EVENTS (next 7 days):\n${list}`);
-          }
-        }
-      } catch {}
-    }
-    return parts.join('\n\n');
+  /**
+   * Fetch calendar events from the device (if bpCal permission granted).
+   * Returns an array of event objects — sent to the server so Banner can call
+   * the get_calendar_events tool on demand instead of getting a context dump.
+   */
+  const getCalendarEvents = async () => {
+    if (!bpCal) return [];
+    try {
+      const { status } = await Calendar.requestCalendarPermissionsAsync();
+      if (status !== 'granted') return [];
+      const now  = new Date();
+      const in7d = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+      const cals = await Calendar.getCalendarsAsync(Calendar.EntityTypes.EVENT);
+      const evts = await Calendar.getEventsAsync(cals.map(c => c.id), now, in7d);
+      return evts.slice(0, 100).map(e => ({
+        title:    e.title,
+        start:    e.startDate,
+        end:      e.endDate,
+        location: e.location || '',
+        notes:    e.notes || '',
+      }));
+    } catch { return []; }
   };
 
   /** Execute a Banner action after user confirmation. */
@@ -2653,7 +2643,7 @@ function BotTab({ token, wsRef, currentUser }) {
     setPendingAction(null);
     try {
       if (action.type === 'send_message') {
-        const target = users.find(u =>
+        const target = contacts.find(u =>
           u.username === action.to_username ||
           (u.displayName || '').toLowerCase() === (action.to_username || '').toLowerCase()
         );
@@ -2705,8 +2695,8 @@ function BotTab({ token, wsRef, currentUser }) {
     setTyping(true); setLoading(true);
     typingTimer.current = setTimeout(async () => {
       try {
-        const context = await buildContext();
-        const body = { message: content || 'Describe this image.', context };
+        const calendar_events = await getCalendarEvents();
+        const body = { message: content || 'Describe this image.', calendar_events };
         if (imgToSend?.base64) { body.image_base64 = imgToSend.base64; body.image_mime = imgToSend.mimeType || 'image/jpeg'; }
         const data = await api('/api/bot/chat', 'POST', body, token);
         const raw  = data.reply || '...';
@@ -3135,9 +3125,10 @@ function ProfileTab({ token, currentUser, onLogout }) {
 function ContactsTab({ token, currentUser, onOpenDM }) {
   const { styles, C } = useSkin();
   // contacts  → array of { contactId, userId, username, displayName, online, since }
-  // users     → array of { id, username, displayName, online, isMe }
+  // searchResults → array from /api/users/search (id, username, displayName, contactStatus)
   const [contacts,       setContacts]       = useState([]);
-  const [users,          setUsers]          = useState([]);
+  const [searchResults,  setSearchResults]  = useState([]);
+  const [searching,      setSearching]      = useState(false);
   const [loading,        setLoading]        = useState(true);
   const [refreshing,     setRefreshing]     = useState(false);
   const [err,            setErr]            = useState('');
@@ -3150,22 +3141,36 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
   const [contactsLoading,setContactsLoading]= useState(false);
   const [contactsQuery,  setContactsQuery]  = useState('');
   const [inviting,       setInviting]       = useState(null);
+  const searchDebounceRef = useRef(null);
 
   const fetchAll = useCallback(async (isRefresh = false) => {
     if (isRefresh) setRefreshing(true); else setLoading(true);
     setErr('');
     try {
-      const [c, u] = await Promise.all([
-        api('/api/contacts', 'GET', null, token),
-        api('/api/users',    'GET', null, token),
-      ]);
+      const c = await api('/api/contacts', 'GET', null, token);
       setContacts(Array.isArray(c) ? c : []);
-      setUsers(Array.isArray(u) ? u.filter(u2 => !u2.isMe) : []);
     } catch (e) { setErr(e.message); }
     finally { setLoading(false); setRefreshing(false); }
   }, [token]);
 
   useEffect(() => { fetchAll(); }, [fetchAll]);
+
+  // Debounced search against /api/users/search when the search panel is open
+  useEffect(() => {
+    if (!showSearch) { setSearchResults([]); return; }
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    const q = query.trim();
+    if (q.length < 2) { setSearchResults([]); return; }
+    setSearching(true);
+    searchDebounceRef.current = setTimeout(async () => {
+      try {
+        const data = await api(`/api/users/search?q=${encodeURIComponent(q)}`, 'GET', null, token);
+        setSearchResults(Array.isArray(data) ? data : []);
+      } catch { setSearchResults([]); }
+      finally { setSearching(false); }
+    }, 300);
+    return () => { if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current); };
+  }, [query, showSearch, token]);
 
   const act = async (key, fn) => {
     setActioning(a => ({ ...a, [key]: true }));
@@ -3265,34 +3270,31 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
     }
   };
 
-  // Find and instantly add app users matching this phone contact's name
+  // Find app users by phone contact name — queries the search endpoint directly
   const findOnApp = async (contact) => {
-    const words = contact.name.toLowerCase().split(/\s+/).filter(w => w.length > 1);
-    const matches = users.filter(u =>
-      !contactUserIds.has(u.id) &&
-      words.some(w =>
-        (u.username || '').toLowerCase().includes(w) ||
-        (u.displayName || '').toLowerCase().includes(w)
-      )
-    );
-    if (matches.length === 0) {
-      Alert.alert('NOT ON APP', `No users found matching "${contact.name}".\n\nSend them an SMS invite to join.`);
-    } else if (matches.length === 1) {
-      setShowInvite(false);
-      await addContact(matches[0].id);
-    } else {
-      // Multiple matches — show in search
-      setShowInvite(false);
-      setQuery(contact.name.split(' ')[0]);
-      setShowSearch(true);
+    const q = contact.name.split(' ')[0]; // search by first name
+    if (q.length < 2) {
+      Alert.alert('NOT ON APP', `Cannot search for "${contact.name}" — name too short.`);
+      return;
     }
+    try {
+      const data = await api(`/api/users/search?q=${encodeURIComponent(q)}`, 'GET', null, token);
+      const matches = Array.isArray(data) ? data.filter(u => !contactUserIds.has(u.id)) : [];
+      if (matches.length === 0) {
+        Alert.alert('NOT ON APP', `No users found matching "${contact.name}".\n\nSend them an SMS invite to join.`);
+      } else if (matches.length === 1) {
+        setShowInvite(false);
+        await addContact(matches[0].id);
+      } else {
+        // Multiple matches — open search panel pre-filled
+        setShowInvite(false);
+        setQuery(q);
+        setShowSearch(true);
+      }
+    } catch (e) { Alert.alert('ERROR', e.message); }
   };
 
   const contactUserIds = new Set(contacts.map(c => c.userId));
-
-  const filteredUsers = query.trim()
-    ? users.filter(u => (u.username + (u.displayName || '')).toLowerCase().includes(query.toLowerCase()))
-    : users;
 
   if (loading) return <View style={styles.centerFill}><Spinner size="large" /></View>;
 
@@ -3349,7 +3351,11 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
               autoCapitalize="none"
             />
           </View>
-          {filteredUsers.map(u => {
+          {searching && <View style={{ alignItems: 'center', paddingVertical: 8 }}><Spinner /></View>}
+          {!searching && query.trim().length >= 2 && searchResults.length === 0 && (
+            <Text style={styles.emptyText}>NO USERS FOUND</Text>
+          )}
+          {searchResults.map(u => {
             const isContact = contactUserIds.has(u.id);
             const key = `add_${u.id}`;
             return (
