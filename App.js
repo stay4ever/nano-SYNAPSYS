@@ -4060,7 +4060,7 @@ function BotTab({ token, wsRef }) {
           permissions: { msgs: bpMsgs, send: bpSend, cal: bpCal, contacts: bpCon },
         };
         if (imgToSend?.base64) { body.image_base64 = imgToSend.base64; body.image_mime = imgToSend.mimeType || 'image/jpeg'; }
-        const data = await api('/api/bot/chat', 'POST', body, null); // null → uses _SESSION_TOKEN (always fresh)
+        const data = await api('/api/bot/chat', 'POST', body, token);
         const raw  = data.reply || '...';
         // Parse optional <<<ACTION:{...}>>> block appended by Banner
         const ACTION_RE = /<<<ACTION:([\s\S]*?)>>>/;
@@ -4390,7 +4390,13 @@ function ProfileTab({ token, currentUser, onLogout, profileImageUri, setProfileI
       <TouchableOpacity onPress={handlePickProfileImage} style={{ alignItems: 'center', marginVertical: 24 }}>
         {profileImageUri
           ? <Image source={{ uri: profileImageUri }} style={{ width: 96, height: 96, borderRadius: 48 }}
-              onError={() => { setProfileImageUri(null); SecureStore.deleteItemAsync(PROFILE_IMAGE_KEY); }} />
+              onError={async () => {
+                // Only clear if the file is truly gone — don't wipe on transient load failures
+                try {
+                  const info = await FileSystem.getInfoAsync(profileImageUri);
+                  if (!info.exists) { setProfileImageUri(null); SecureStore.deleteItemAsync(PROFILE_IMAGE_KEY); }
+                } catch { /* keep the URI — file may still be valid */ }
+              }} />
           : <View style={{ width: 96, height: 96, borderRadius: 48, backgroundColor: avatarBg, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: C.accent }}>
               <Text style={{ color: '#fff', fontSize: 38, fontWeight: '700', fontFamily: mono }}>{initials}</Text>
             </View>
@@ -5666,6 +5672,7 @@ function AppInner() {
               if (data.refresh) await saveBioRefresh(data.refresh);
               await saveToken(data.token); await saveUser(data.user);
               setToken(data.token); setUser(data.user);
+              _setSession(data.token, data.refresh, setToken);
               setAppState('home');
               return;
             } catch {
