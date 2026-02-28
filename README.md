@@ -1,4 +1,4 @@
-# nano-SYNAPSYS
+#SYNAPTYC
 
 > **Encrypted iOS Messaging — Beyond Signal. Beyond WhatsApp.**
 
