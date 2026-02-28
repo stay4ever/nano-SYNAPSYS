@@ -1159,16 +1159,51 @@ function encryptKeyForMember() { return null; }
 function decryptGroupKey() { return null; }
 
 // ---------------------------------------------------------------------------
-// API HELPER
+// API HELPER — with automatic JWT refresh on 401
 // ---------------------------------------------------------------------------
-async function api(path, method = 'GET', body = null, token = null) {
+// Module-level session (updated on login / refresh — avoids stale closure tokens)
+let _SESSION_TOKEN   = null;
+let _SESSION_REFRESH = null;
+let _SESSION_UPDATER = null;  // React setState from AppInner
+
+function _setSession(token, refresh, updater) {
+  _SESSION_TOKEN   = token;
+  _SESSION_REFRESH = refresh ?? _SESSION_REFRESH;
+  if (updater) _SESSION_UPDATER = updater;
+}
+
+async function api(path, method = 'GET', body = null, token = null, _isRetry = false) {
+  const tok = token ?? _SESSION_TOKEN;
   const headers = { 'Content-Type': 'application/json' };
-  if (token) headers['Authorization'] = `Bearer ${token}`;
+  if (tok) headers['Authorization'] = `Bearer ${tok}`;
   const opts = { method, headers };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(`${BASE_URL}${path}`, opts);
   let data;
   try { data = await res.json(); } catch { data = {}; }
+
+  // Auto-refresh on 401 (expired access token) — one retry only
+  if (res.status === 401 && !_isRetry && _SESSION_REFRESH) {
+    try {
+      const rr = await fetch(`${BASE_URL}/auth/bio-refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh: _SESSION_REFRESH }),
+      });
+      if (rr.ok) {
+        const rd = await rr.json();
+        _SESSION_TOKEN = rd.token;
+        if (rd.refresh) { _SESSION_REFRESH = rd.refresh; }
+        // Persist new tokens
+        await SecureStore.setItemAsync(JWT_KEY, rd.token);
+        if (rd.refresh) await SecureStore.setItemAsync(BIO_REFRESH_KEY, rd.refresh);
+        // Notify React state so future renders pick up new token
+        if (_SESSION_UPDATER) _SESSION_UPDATER(rd.token);
+        return api(path, method, body, rd.token, true);
+      }
+    } catch {}
+  }
+
   if (!res.ok) {
     // Extract error message from Phoenix/Ecto/Django formats
     let msg;
@@ -3308,6 +3343,11 @@ function GroupsTab({ token, onOpenGroup, unread = {} }) {
 
   if (loading) return <View style={styles.centerFill}><Spinner size="large" /></View>;
 
+  const GROUP_COLORS = ['#1a2e1a','#1a1a3a','#2e1a2e','#2e1a0a','#0a1a2e','#1a2e24','#24152e','#2e1a10'];
+  const screenW2 = Dimensions.get('window').width;
+  const cardW2   = (screenW2 - CHAT_CARD_MARGIN * 2 - CHAT_CARD_GAP) / 2;
+  const mono2    = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
+
   return (
     <View style={styles.flex}>
       <ErrText msg={err} />
@@ -3328,47 +3368,111 @@ function GroupsTab({ token, onOpenGroup, unread = {} }) {
         </View>
       )}
       <FlatList
-        data={groups} keyExtractor={(g) => String(g.id)}
-        extraData={groups}
+        data={groups}
+        keyExtractor={(g) => String(g.id)}
+        numColumns={2}
+        columnWrapperStyle={{ gap: CHAT_CARD_GAP, paddingHorizontal: CHAT_CARD_MARGIN }}
+        contentContainerStyle={{ paddingTop: 10, paddingBottom: 100, gap: CHAT_CARD_GAP }}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchGroups(true)} tintColor={C.accent} />}
         ListHeaderComponent={!showForm ? (
-          <TouchableOpacity style={styles.createGroupBtn} onPress={() => setShowForm(true)}>
-            <Text style={styles.createGroupBtnText}>+ NEW GROUP</Text>
-          </TouchableOpacity>
+          <View style={{ paddingHorizontal: CHAT_CARD_MARGIN, paddingBottom: 8 }}>
+            <TouchableOpacity style={styles.createGroupBtn} onPress={() => setShowForm(true)}>
+              <Text style={styles.createGroupBtnText}>+ NEW GROUP</Text>
+            </TouchableOpacity>
+          </View>
         ) : null}
-        ListEmptyComponent={<Text style={styles.emptyText}>NO GROUPS YET</Text>}
+        ListEmptyComponent={<Text style={[styles.emptyText, { textAlign: 'center', marginTop: 40 }]}>NO GROUPS YET</Text>}
         renderItem={({ item }) => {
           const cnt = unread[`group_${item.id}`] || 0;
           const isAdmin = item.my_role === 'admin';
+          const initials = (item.name || 'G')[0].toUpperCase();
+          const bgColor  = GROUP_COLORS[item.id % GROUP_COLORS.length];
+          const subtitle = item.description || `CREATED ${fmtDate(item.created_at)}`;
+
           return (
-            <SwipeableRow
-              key={`grp-${item.id}`}
-              rightLabel={isAdmin ? 'DELETE' : 'LEAVE'}
-              rightColor={isAdmin ? C.red : C.amber}
-              onAction={() => isAdmin ? deleteGroup(item) : leaveGroup(item)}
+            <TouchableOpacity
+              style={{
+                width: cardW2,
+                backgroundColor: 'rgba(0,255,65,0.07)',
+                borderWidth: 1,
+                borderColor: 'rgba(0,255,65,0.15)',
+                borderRadius: 16,
+                padding: 12,
+                alignItems: 'center',
+                position: 'relative',
+              }}
+              onPress={() => onOpenGroup(item)}
+              onLongPress={() => {
+                const actions = isAdmin
+                  ? [
+                      { text: 'CANCEL', style: 'cancel' },
+                      { text: 'DELETE GROUP', style: 'destructive', onPress: () => deleteGroup(item) },
+                    ]
+                  : [
+                      { text: 'CANCEL', style: 'cancel' },
+                      { text: 'LEAVE GROUP', style: 'destructive', onPress: () => leaveGroup(item) },
+                    ];
+                Alert.alert(item.name, isAdmin ? 'Delete this group for everyone?' : 'Leave this group?', actions);
+              }}
+              delayLongPress={500}
+              activeOpacity={0.75}
             >
-              <TouchableOpacity style={styles.userRow} onPress={() => onOpenGroup(item)}>
-                <View style={[styles.userRowInfo, { flex: 1 }]}>
-                  <Text style={styles.userRowName}>{item.name}</Text>
-                  {item.description
-                    ? <Text style={styles.userRowMeta} numberOfLines={1}>{item.description}</Text>
-                    : <Text style={styles.userRowMeta}>CREATED {fmtDate(item.created_at)}</Text>
-                  }
+              {/* Unread badge */}
+              {cnt > 0 && (
+                <View style={{
+                  position: 'absolute', top: -6, right: -6,
+                  backgroundColor: '#ee0011',
+                  width: 20, height: 20, borderRadius: 10,
+                  alignItems: 'center', justifyContent: 'center',
+                  zIndex: 10,
+                }}>
+                  <Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>{cnt > 99 ? '99+' : cnt}</Text>
                 </View>
-                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                  {cnt > 0 && (
-                    <View style={styles.rowBadge}>
-                      <Text style={styles.rowBadgeText}>{cnt > 99 ? '99+' : cnt}</Text>
-                    </View>
-                  )}
-                  <Text style={styles.chevron}>{'>'}</Text>
+              )}
+
+              {/* Group avatar */}
+              <View style={{
+                width: 56, height: 56, borderRadius: 16,
+                backgroundColor: bgColor,
+                alignItems: 'center', justifyContent: 'center',
+                marginBottom: 8,
+                borderWidth: 2,
+                borderColor: 'rgba(0,255,65,0.3)',
+              }}>
+                <Text style={{ color: '#00ff41', fontSize: 24, fontWeight: '700', fontFamily: mono2 }}>{initials}</Text>
+              </View>
+
+              {/* Name */}
+              <Text style={{ fontFamily: mono2, fontSize: 12, fontWeight: '700', color: C.text, letterSpacing: 0.5, textAlign: 'center' }} numberOfLines={1}>{item.name}</Text>
+
+              {/* Description / date */}
+              <Text style={{ fontFamily: mono2, fontSize: 9, color: C.dim, letterSpacing: 0.5, marginTop: 3, textAlign: 'center' }} numberOfLines={1}>{subtitle}</Text>
+
+              {/* Admin badge */}
+              {isAdmin && (
+                <View style={{ marginTop: 6, backgroundColor: 'rgba(0,255,65,0.15)', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 }}>
+                  <Text style={{ fontFamily: mono2, fontSize: 8, color: C.accent, letterSpacing: 1 }}>ADMIN</Text>
                 </View>
-              </TouchableOpacity>
-            </SwipeableRow>
+              )}
+            </TouchableOpacity>
           );
         }}
-        ItemSeparatorComponent={() => <View style={styles.separator} />}
       />
+
+      {/* Floating + button */}
+      <TouchableOpacity
+        onPress={() => setShowForm(true)}
+        style={{
+          position: 'absolute', bottom: 20, right: 20,
+          width: 52, height: 52, borderRadius: 26,
+          backgroundColor: C.accent,
+          justifyContent: 'center', alignItems: 'center',
+          shadowColor: C.accent, shadowOpacity: 0.5, shadowRadius: 10, shadowOffset: { width: 0, height: 4 },
+          elevation: 8,
+        }}
+      >
+        <Text style={{ fontSize: 30, color: '#050f05', fontWeight: '700', lineHeight: 34 }}>+</Text>
+      </TouchableOpacity>
     </View>
   );
 }
@@ -4177,7 +4281,7 @@ function ProfileTab({ token, currentUser, onLogout }) {
         }
         <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, marginTop: 6, letterSpacing: 0.5 }}>tap to change photo</Text>
       </TouchableOpacity>
-      <Text style={{ fontFamily: mono, fontSize: 16, fontWeight: '700', color: C.text, textAlign: 'center', letterSpacing: 1, marginBottom: 4 }}>{currentUser.display_name || currentUser.displayName || currentUser.username}</Text>
+      <Text style={{ fontFamily: mono, fontSize: 16, fontWeight: '700', color: C.text, textAlign: 'center', letterSpacing: 1, marginBottom: 4 }}>{displayName || currentUser.display_name || currentUser.displayName || currentUser.username}</Text>
       <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, textAlign: 'center', letterSpacing: 1, marginBottom: 16 }}>@{currentUser.username}</Text>
 
       {/* ── READ-ONLY INFO ──────────────────────────────────────────── */}
@@ -5455,6 +5559,8 @@ function AppInner() {
         const user = rawMe?.user ?? rawMe;
         await saveUser(user);
         setToken(storedToken); setUser(user);
+        // Register global session for auto-refresh during active use
+        loadBioRefresh().then(r => _setSession(storedToken, r, setToken));
         const bioEnabled = await loadBioEnabled();
         const bioReady   = await isBiometricReady();
         setAppState(bioEnabled && bioReady ? 'biometric' : 'home');
@@ -5467,6 +5573,8 @@ function AppInner() {
 
   const handleAuth = useCallback((t, u) => {
     setToken(t); setUser(u);
+    // Register with global session for auto-refresh
+    loadBioRefresh().then(r => _setSession(t, r, setToken));
     // Clear invite state once registration/login is complete
     setInviteToken(null); setInviterName(null);
     setAppState('home');
