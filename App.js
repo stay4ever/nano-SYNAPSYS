@@ -3007,6 +3007,31 @@ function BotTab({ token, wsRef }) {
   useEffect(() => { return () => { if (typingTimer.current) clearTimeout(typingTimer.current); }; }, []);
 
   /**
+   * Fetch phone contacts from the device (if bpCon permission granted).
+   * Passed to the server so Banner can call list_phone_contacts on demand.
+   * Only name + primary phone are sent — no emails, addresses, etc.
+   */
+  const getPhoneContacts = async () => {
+    if (!bpCon) return [];
+    try {
+      const { status } = await Contacts.requestPermissionsAsync();
+      if (status !== 'granted') return [];
+      const { data } = await Contacts.getContactsAsync({
+        fields: [Contacts.Fields.Name, Contacts.Fields.PhoneNumbers],
+      });
+      const out = [];
+      for (const c of data) {
+        const name  = c.name || '';
+        const phone = c.phoneNumbers?.[0]?.number || '';
+        if (name && phone) out.push({ name, phone });
+      }
+      // Sort alphabetically and cap at 300
+      out.sort((a, b) => a.name.localeCompare(b.name));
+      return out.slice(0, 300);
+    } catch { return []; }
+  };
+
+  /**
    * Fetch calendar events from the device (if bpCal permission granted).
    * Returns an array of event objects — sent to the server so Banner can call
    * the get_calendar_events tool on demand instead of getting a context dump.
@@ -3066,6 +3091,16 @@ function BotTab({ token, wsRef }) {
           content: `\u2713 Event "${action.title}" added to your calendar.`,
           ts: new Date().toISOString(),
         }]);
+      } else if (action.type === 'send_sms') {
+        const phone = (action.to_phone || '').replace(/(?!^\+)[^\d]/g, '');
+        const smsAvail = await SMS.isAvailableAsync();
+        if (!smsAvail) { Alert.alert('SMS UNAVAILABLE', 'SMS is not available on this device.'); return; }
+        await SMS.sendSMSAsync([phone], action.content || '');
+        setMessages(prev => [...prev, {
+          id: Date.now(), role: 'bot',
+          content: `\u2197 SMS composer opened for ${action.to_name || action.to_phone}.`,
+          ts: new Date().toISOString(),
+        }]);
       }
     } catch (e) { Alert.alert('ERROR', e.message); }
   };
@@ -3087,10 +3122,14 @@ function BotTab({ token, wsRef }) {
     setTyping(true); setLoading(true);
     typingTimer.current = setTimeout(async () => {
       try {
-        const calendar_events = await getCalendarEvents();
+        const [calendar_events, phone_contacts] = await Promise.all([
+          getCalendarEvents(),
+          getPhoneContacts(),
+        ]);
         const body = {
           message: content || 'Describe this image.',
           calendar_events,
+          phone_contacts,
           permissions: { msgs: bpMsgs, send: bpSend, cal: bpCal, contacts: bpCon },
         };
         if (imgToSend?.base64) { body.image_base64 = imgToSend.base64; body.image_mime = imgToSend.mimeType || 'image/jpeg'; }
@@ -3105,7 +3144,8 @@ function BotTab({ token, wsRef }) {
             const action = JSON.parse(match[1]);
             const permitted =
               (action.type === 'send_message' && bpSend) ||
-              (action.type === 'create_event'  && bpCal);
+              (action.type === 'create_event'  && bpCal) ||
+              (action.type === 'send_sms'      && bpCon);
             if (permitted) setPendingAction(action);
           } catch {}
         }
@@ -3198,11 +3238,19 @@ function BotTab({ token, wsRef }) {
       {pendingAction && (
         <View style={{ margin: 10, padding: 12, borderRadius: 6, borderWidth: 1, borderColor: C.accent, backgroundColor: C.panel }}>
           <Text style={{ fontFamily: mono, fontSize: 10, color: C.accent, letterSpacing: 1.5, marginBottom: 8 }}>
-            {pendingAction.type === 'send_message' ? '\u2197 BANNER WANTS TO SEND A MESSAGE' : '\uD83D\uDCC5 BANNER WANTS TO CREATE AN EVENT'}
+            {pendingAction.type === 'send_message' ? '\u2197 BANNER WANTS TO SEND A MESSAGE'
+              : pendingAction.type === 'send_sms'  ? '\uD83D\uDCF1 BANNER WANTS TO SEND AN SMS'
+              : '\uD83D\uDCC5 BANNER WANTS TO CREATE AN EVENT'}
           </Text>
           {pendingAction.type === 'send_message' ? (
             <>
               <Text style={{ fontFamily: mono, fontSize: 11, color: C.fg ?? C.green, marginBottom: 2 }}>To: {pendingAction.to_username}</Text>
+              <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, marginBottom: 10 }}>"{pendingAction.content}"</Text>
+            </>
+          ) : pendingAction.type === 'send_sms' ? (
+            <>
+              <Text style={{ fontFamily: mono, fontSize: 11, color: C.fg ?? C.green, marginBottom: 2 }}>To: {pendingAction.to_name || pendingAction.to_phone}</Text>
+              <Text style={{ fontFamily: mono, fontSize: 10, color: C.dim, marginBottom: 2 }}>{pendingAction.to_phone}</Text>
               <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, marginBottom: 10 }}>"{pendingAction.content}"</Text>
             </>
           ) : (
