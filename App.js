@@ -1984,7 +1984,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
     // Request contacts permission
     const { status } = await Contacts.requestPermissionsAsync();
     if (status !== 'granted') {
-      setContactsErr('Contacts permission denied.\nGo to Settings → Expo Go → Contacts → Allow.');
+      setContactsErr('CONTACTS PERMISSION DENIED');
       return;
     }
 
@@ -2040,10 +2040,13 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
   const cancelInvite = async (phone) => {
     const map = await _pcLoad();
     const key = _nrmPh(phone);
-    // If we stored the invite token, tell the server to expire it immediately
     const storedToken = map[key]?.t;
     if (storedToken) {
+      // Cancel the specific invite by token (new behaviour)
       try { await api(`/api/invites/cancel/${storedToken}`, 'DELETE', null, token); } catch {}
+    } else {
+      // No token stored (pre-fix invite) — bulk-cancel all active invites to clear the cap
+      try { await api('/api/invites', 'DELETE', null, token); } catch {}
     }
     delete map[key];
     try { await SecureStore.setItemAsync(_PC_KEY, JSON.stringify(map)); } catch {}
@@ -2176,7 +2179,18 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
           {contactsLoading ? (
             <View style={{ paddingVertical: 40, alignItems: 'center' }}><Spinner size="large" /></View>
           ) : contactsErr ? (
-            <Text style={{ fontFamily: mono, fontSize: 11, color: C.red, padding: 16 }}>{contactsErr}</Text>
+            <View style={{ padding: 24, alignItems: 'center', gap: 14 }}>
+              <Text style={{ fontFamily: mono, fontSize: 11, color: C.red, textAlign: 'center', letterSpacing: 1 }}>{contactsErr}</Text>
+              <Text style={{ fontFamily: mono, fontSize: 10, color: C.dim, textAlign: 'center', lineHeight: 16 }}>
+                {'Allow contacts access in:\nSettings → nano-SYNAPSYS → Contacts'}
+              </Text>
+              <TouchableOpacity
+                onPress={() => Linking.openURL('app-settings:')}
+                style={{ borderWidth: 1, borderColor: C.accent, paddingHorizontal: 20, paddingVertical: 8, borderRadius: 4 }}
+              >
+                <Text style={{ fontFamily: mono, fontSize: 11, color: C.accent, letterSpacing: 1 }}>OPEN SETTINGS</Text>
+              </TouchableOpacity>
+            </View>
           ) : (
             <FlatList
               data={filtered}
