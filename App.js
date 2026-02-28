@@ -1622,7 +1622,7 @@ function BiometricUnlockScreen({ onUnlock, onUsePassword }) {
     <ThemedSafeArea>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <View style={styles.centerFill}>
-        <Text style={styles.logoText}>nano-SYNAPSYS</Text>
+        <Image source={require('./assets/icon.png')} style={{ width: 96, height: 96, borderRadius: 22, marginBottom: 10 }} resizeMode="contain" />
         <Text style={styles.logoSub}>AI EVOLUTION SECURE MESH</Text>
         <View style={{ height: 48 }} />
         <TouchableOpacity onPress={() => tryBiometric(false)} disabled={loading} activeOpacity={0.7}>
@@ -1659,6 +1659,10 @@ function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
   const [bioSupported, setBioSupported] = useState(false);
   const [bioReady, setBioReady]         = useState(false);
   const [bioLoading, setBioLoading]     = useState(false);
+  const [showReset, setShowReset]       = useState(false);
+  const [resetEmail, setResetEmail]     = useState('');
+  const [resetLoading, setResetLoading] = useState(false);
+  const [resetMsg, setResetMsg]         = useState('');
 
   useEffect(() => {
     (async () => {
@@ -1737,13 +1741,24 @@ function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
     finally { setLoading(false); }
   };
 
+  const handlePasswordReset = async () => {
+    if (!resetEmail.trim()) { setResetMsg('Enter your email address.'); return; }
+    setResetLoading(true); setResetMsg('');
+    try {
+      await api('/auth/password-reset', 'POST', { email: resetEmail.trim() });
+      setResetMsg('CHECK YOUR EMAIL — a reset link has been sent.');
+    } catch (e) {
+      setResetMsg(e.message || 'Could not send reset link. Check the email and try again.');
+    } finally { setResetLoading(false); }
+  };
+
   return (
     <ThemedSafeArea>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <KeyboardAvoidingView style={styles.flex} behavior={KAV_BEHAVIOR}>
         <ScrollView contentContainerStyle={styles.authScroll} keyboardShouldPersistTaps="handled">
           <View style={styles.logoBlock}>
-            <Text style={styles.logoText}>nano-SYNAPSYS</Text>
+            <Image source={require('./assets/icon.png')} style={{ width: 96, height: 96, borderRadius: 22, marginBottom: 10 }} resizeMode="contain" />
             <Text style={styles.logoSub}>AI EVOLUTION SECURE MESH</Text>
           </View>
 
@@ -1801,6 +1816,43 @@ function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
                   </View>
                 )}
               </TouchableOpacity>
+            )}
+            {tab === 'LOGIN' && !showReset && (
+              <TouchableOpacity onPress={() => { setShowReset(true); setResetMsg(''); setResetEmail(''); }} style={{ alignItems: 'center', marginTop: 16 }}>
+                <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, letterSpacing: 1 }}>FORGOT PASSWORD?</Text>
+              </TouchableOpacity>
+            )}
+            {tab === 'LOGIN' && showReset && (
+              <View style={{ marginTop: 20, borderTopWidth: 1, borderTopColor: C.border, paddingTop: 16 }}>
+                <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, letterSpacing: 1, marginBottom: 10 }}>
+                  RESET PASSWORD
+                </Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="YOUR EMAIL ADDRESS"
+                  placeholderTextColor={C.muted}
+                  value={resetEmail}
+                  onChangeText={setResetEmail}
+                  autoCapitalize="none"
+                  keyboardType="email-address"
+                  autoCorrect={false}
+                />
+                {!!resetMsg && (
+                  <Text style={{ fontFamily: mono, fontSize: 10, color: resetMsg.startsWith('CHECK') ? C.accent : C.red, textAlign: 'center', marginBottom: 8, lineHeight: 16 }}>
+                    {resetMsg}
+                  </Text>
+                )}
+                <TouchableOpacity
+                  style={[styles.primaryBtn, resetLoading && styles.primaryBtnDisabled]}
+                  onPress={handlePasswordReset}
+                  disabled={resetLoading}
+                >
+                  {resetLoading ? <Spinner /> : <Text style={styles.primaryBtnText}>SEND RESET LINK</Text>}
+                </TouchableOpacity>
+                <TouchableOpacity onPress={() => { setShowReset(false); setResetMsg(''); }} style={{ alignItems: 'center', marginTop: 12 }}>
+                  <Text style={{ fontFamily: mono, fontSize: 10, color: C.dim, letterSpacing: 1 }}>CANCEL</Text>
+                </TouchableOpacity>
+              </View>
             )}
           </View>
         </ScrollView>
