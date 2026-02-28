@@ -4253,14 +4253,8 @@ function ProfileTab({ token, currentUser, onLogout }) {
       setResidentialAddr(ext.residentialAddr ?? '');
       setWorkAddr(ext.workAddr ?? '');
       setBpMsgs(pmMsgs); setBpSend(pmSend); setBpCal(pmCal); setBpCon(pmCon);
-      // Load saved profile image — verify file still exists on disk
-      if (savedUri) {
-        try {
-          const info = await FileSystem.getInfoAsync(savedUri);
-          if (info.exists) setProfileImageUri(savedUri);
-          else await SecureStore.deleteItemAsync(PROFILE_IMAGE_KEY);
-        } catch { /* URI invalid — leave as letter avatar */ }
-      }
+      // Load saved profile image — trust SecureStore; Image onError handles stale URIs
+      if (savedUri) setProfileImageUri(savedUri);
     })();
   }, []);
 
@@ -4368,7 +4362,8 @@ function ProfileTab({ token, currentUser, onLogout }) {
       {/* ── CIRCULAR AVATAR ──────────────────────────────────────── */}
       <TouchableOpacity onPress={handlePickProfileImage} style={{ alignItems: 'center', marginVertical: 24 }}>
         {profileImageUri
-          ? <Image source={{ uri: profileImageUri }} style={{ width: 96, height: 96, borderRadius: 48 }} />
+          ? <Image source={{ uri: profileImageUri }} style={{ width: 96, height: 96, borderRadius: 48 }}
+              onError={() => { setProfileImageUri(null); SecureStore.deleteItemAsync(PROFILE_IMAGE_KEY); }} />
           : <View style={{ width: 96, height: 96, borderRadius: 48, backgroundColor: avatarBg, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: C.accent }}>
               <Text style={{ color: '#fff', fontSize: 38, fontWeight: '700', fontFamily: mono }}>{initials}</Text>
             </View>
