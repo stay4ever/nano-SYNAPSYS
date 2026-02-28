@@ -1,9 +1,9 @@
 {
   "expo": {
-    "name": "nano-SYNAPSYS",
-    "slug": "nano-synapsys",
+    "name": "SYNAPTYC",
+    "slug": "synaptyc",
     "version": "1.2.1",
-    "scheme": "nanosynapsys",
+    "scheme": "synaptyc",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -14,23 +14,23 @@
       "backgroundColor": "#050f05"
     },
     "ios": {
-      "bundleIdentifier": "com.aievolution.nanosynapsys",
+      "bundleIdentifier": "com.aievolution.synaptyc",
       "buildNumber": "9",
       "supportsTablet": false,
       "icon": "./assets/icon.png",
       "infoPlist": {
-        "NSFaceIDUsageDescription": "nano-SYNAPSYS uses Face ID to protect your secure messages.",
-        "NSContactsUsageDescription": "nano-SYNAPSYS reads your contacts so you can invite them to join.",
-        "NSCameraUsageDescription": "nano-SYNAPSYS uses the camera to capture images for chat.",
-        "NSPhotoLibraryUsageDescription": "nano-SYNAPSYS accesses your photos to send images in chat.",
-        "NSLocationWhenInUseUsageDescription": "nano-SYNAPSYS uses your location to attach GPS coordinates to your profile.",
-        "NSCalendarsFullAccessUsageDescription": "nano-SYNAPSYS reads your calendar so Banner AI can see your schedule and create events.",
-        "NSRemindersFullAccessUsageDescription": "nano-SYNAPSYS reads your reminders so Banner AI can help manage your tasks.",
+        "NSFaceIDUsageDescription": "SYNAPTYC uses Face ID to protect your secure messages.",
+        "NSContactsUsageDescription": "SYNAPTYC reads your contacts so you can invite them to join.",
+        "NSCameraUsageDescription": "SYNAPTYC uses the camera to capture images for chat.",
+        "NSPhotoLibraryUsageDescription": "SYNAPTYC accesses your photos to send images in chat.",
+        "NSLocationWhenInUseUsageDescription": "SYNAPTYC uses your location to attach GPS coordinates to your profile.",
+        "NSCalendarsFullAccessUsageDescription": "SYNAPTYC reads your calendar so Banner AI can see your schedule and create events.",
+        "NSRemindersFullAccessUsageDescription": "SYNAPTYC reads your reminders so Banner AI can help manage your tasks.",
         "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
-      "package": "com.aievolution.nanosynapsys",
+      "package": "com.aievolution.synaptyc",
       "versionCode": 3,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
@@ -55,34 +55,34 @@
       [
         "expo-calendar",
         {
-          "calendarPermission": "nano-SYNAPSYS reads your calendar so Banner AI can see your schedule and create events.",
-          "remindersPermission": "nano-SYNAPSYS reads your reminders so Banner AI can help manage your tasks."
+          "calendarPermission": "SYNAPTYC reads your calendar so Banner AI can see your schedule and create events.",
+          "remindersPermission": "SYNAPTYC reads your reminders so Banner AI can help manage your tasks."
         }
       ],
       [
         "expo-local-authentication",
         {
-          "faceIDPermission": "nano-SYNAPSYS uses Face ID to protect your secure messages."
+          "faceIDPermission": "SYNAPTYC uses Face ID to protect your secure messages."
         }
       ],
       [
         "expo-image-picker",
         {
-          "photosPermission": "nano-SYNAPSYS accesses your photos to send images in chat.",
-          "cameraPermission": "nano-SYNAPSYS uses the camera to capture images for chat."
+          "photosPermission": "SYNAPTYC accesses your photos to send images in chat.",
+          "cameraPermission": "SYNAPTYC uses the camera to capture images for chat."
         }
       ],
       [
         "expo-location",
         {
-          "locationAlwaysAndWhenInUsePermission": "nano-SYNAPSYS uses your location to attach GPS coordinates to your profile.",
-          "locationWhenInUsePermission": "nano-SYNAPSYS uses your location to attach GPS coordinates to your profile."
+          "locationAlwaysAndWhenInUsePermission": "SYNAPTYC uses your location to attach GPS coordinates to your profile.",
+          "locationWhenInUsePermission": "SYNAPTYC uses your location to attach GPS coordinates to your profile."
         }
       ],
       [
         "expo-contacts",
         {
-          "contactsPermission": "nano-SYNAPSYS reads your contacts so you can invite them to join."
+          "contactsPermission": "SYNAPTYC reads your contacts so you can invite them to join."
         }
       ],
       [

@@ -629,8 +629,8 @@ function useSkin() {
 // ---------------------------------------------------------------------------
 // CONSTANTS
 // ---------------------------------------------------------------------------
-const BASE_URL    = 'https://www.ai-evolution.com.au';
-const WS_URL      = 'wss://www.ai-evolution.com.au/chat';
+const BASE_URL    = 'https://nano-synapsys-server.fly.dev';
+const WS_URL      = 'wss://nano-synapsys-server.fly.dev/socket/websocket';
 const JWT_KEY     = 'nano_jwt';
 const USER_KEY    = 'nano_user';
 const BIO_KEY         = 'nano_bio_enabled';
@@ -878,9 +878,16 @@ async function api(path, method = 'GET', body = null, token = null) {
   let data;
   try { data = await res.json(); } catch { data = {}; }
   if (!res.ok) {
-    const msg =
-      data?.detail || data?.message || data?.error ||
-      (typeof data === 'string' ? data : null) || `HTTP ${res.status}`;
+    // Extract error message from Phoenix/Ecto/Django formats
+    let msg;
+    if (data?.errors && typeof data.errors === 'object' && !Array.isArray(data.errors)) {
+      msg = Object.entries(data.errors).map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`).join('; ');
+    } else if (typeof data?.errors === 'string') {
+      msg = data.errors;
+    } else {
+      msg = data?.detail || data?.message || data?.error ||
+        (typeof data === 'string' ? data : null) || `HTTP ${res.status}`;
+    }
     throw new Error(msg);
   }
   return data;
@@ -2498,6 +2505,13 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
     fetchPubKey(peer.id, token).then(pk => { peerPkRef.current = pk; }).catch(() => {});
   }, [peer.id, token]);
 
+  // Join the Phoenix channel topic for this DM so inbound messages arrive
+  useEffect(() => {
+    if (wsRef.current && wsRef.current._phxJoin) {
+      wsRef.current._phxJoin(`room:${peer.id}`);
+    }
+  }, [peer.id, wsRef]);
+
   // Clean up all pending disappear timers on unmount
   useEffect(() => () => { disappearTimers.current.forEach(clearTimeout); }, []);
 
@@ -2561,11 +2575,13 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
       }
       // Images always go via REST (too large for the WebSocket frame limit).
       // Text goes via WebSocket for real-time delivery; falls back to REST when WS is down.
-      if (!isImage && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        const msgPayload = { type: 'chat_message', to: peer.id, content: payload };
-        if (disappear) msgPayload.disappear_after = disappear;
-        wsRef.current.send(JSON.stringify(msgPayload));
-        // No optimistic push — the server echoes the message back via WS which adds it
+      // Phoenix channel: join the room topic, then push via new_message event
+      if (!isImage && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && wsRef.current._phxSend) {
+        wsRef.current._phxJoin(`room:${peer.id}`);
+        const phxPayload = { content: payload };
+        if (disappear) phxPayload.disappear_after = disappear;
+        wsRef.current._phxSend(`room:${peer.id}`, 'new_message', phxPayload);
+        // No optimistic push — the server echoes the message back via WS
       } else {
         const msg = await api('/api/messages', 'POST', { to: peer.id, content: payload }, token);
         setMessages((prev) => prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]);
@@ -2883,6 +2899,13 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
     loadGroupKey(group.id, token).then(k => { groupKeyRef.current = k; }).catch(() => {});
   }, [group.id, token]);
 
+  // Join the Phoenix channel topic for this group so inbound messages arrive
+  useEffect(() => {
+    if (wsRef.current && wsRef.current._phxJoin) {
+      wsRef.current._phxJoin(`group:${group.id}`);
+    }
+  }, [group.id, wsRef]);
+
   const fetchHistory = useCallback(async () => {
     setLoading(true); setErr('');
     try {
@@ -2933,9 +2956,11 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
           return;
         }
       }
-      if (!isImage && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'group_message', group_id: group.id, content: payload }));
-        // No optimistic push — the server echoes the message back via WS which adds it
+      // Phoenix channel: join the group topic, then push via group_message event
+      if (!isImage && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && wsRef.current._phxSend) {
+        wsRef.current._phxJoin(`group:${group.id}`);
+        wsRef.current._phxSend(`group:${group.id}`, 'group_message', { content: payload });
+        // No optimistic push — the server echoes the message back via WS
       } else {
         const msg = await api(`/api/groups/${group.id}/messages`, 'POST', { content: payload }, token);
         setMessages((prev) => prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]);
@@ -3196,8 +3221,9 @@ function BotTab({ token, wsRef }) {
           (u.displayName || '').toLowerCase() === (action.to_username || '').toLowerCase()
         );
         if (!target) { Alert.alert('USER NOT FOUND', `"${action.to_username}" is not in your contacts.`); return; }
-        if (wsRef?.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ type: 'chat_message', to: target.id, content: action.content }));
+        if (wsRef?.current?.readyState === WebSocket.OPEN && wsRef.current._phxSend) {
+          wsRef.current._phxJoin(`room:${target.id}`);
+          wsRef.current._phxSend(`room:${target.id}`, 'new_message', { content: action.content });
         } else {
           await api('/api/messages', 'POST', { to: target.id, content: action.content }, token);
         }
@@ -4423,18 +4449,49 @@ function HomeScreen({ token, currentUser, onLogout }) {
 
   const connectWS = useCallback(() => {
     if (reconnectRef.current) { clearTimeout(reconnectRef.current); reconnectRef.current = null; }
+    // Phoenix channel protocol — connect to /socket/websocket?token=<JWT>
     const ws = new WebSocket(`${WS_URL}?token=${token}`);
     wsRef.current = ws;
-    ws.onopen = () => { backoffRef.current = 1000; };
+    let phxRef = 1;
+    const phxJoinedTopics = new Set();
+
+    // Helper: send a Phoenix channel frame
+    const phxSend = (topic, event, payload) => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({ topic, event, payload: payload ?? {}, ref: String(phxRef++) }));
+    };
+
+    // Attach helpers so DMChatScreen / GroupChatScreen can join topics and push messages
+    ws._phxSend = phxSend;
+    ws._phxJoin = (topic) => {
+      if (!phxJoinedTopics.has(topic)) {
+        phxJoinedTopics.add(topic);
+        phxSend(topic, 'phx_join', {});
+      }
+    };
+
+    ws.onopen = () => {
+      backoffRef.current = 1000;
+      // Phoenix heartbeat every 30 s keeps the connection alive
+      ws._heartbeat = setInterval(() => phxSend('phoenix', 'heartbeat', {}), 30000);
+    };
+
     ws.onmessage = (event) => {
       try {
-        const msg = JSON.parse(event.data);
-        setIncomingMsg(msg);
+        const frame = JSON.parse(event.data);
+        // Skip Phoenix control frames
+        if (!frame.event || frame.event === 'phx_reply' || frame.event === 'phx_error' || frame.event === 'phx_close') return;
 
-        if (msg.type === 'chat_message') {
-          const fromId = String(msg.from_user?.id ?? msg.from_user ?? msg.from);
+        const { topic, event: evtName, payload: pl } = frame;
+
+        // ── DM: Phoenix emits "new_message" on topic "room:<other_user_id>" ──
+        if (evtName === 'new_message') {
+          // Normalise into the shape the rest of the app already expects
+          const msg = { ...pl, type: 'chat_message' };
+          setIncomingMsg(msg);
+
+          const fromId = String(pl.from_user?.id ?? pl.from_user ?? pl.from);
           const meId   = String(currentUser.id);
-          // Only count messages from others
           if (fromId !== meId) {
             const isViewingThisChat =
               activeTabRef.current === 'CHATS' &&
@@ -4443,23 +4500,27 @@ function HomeScreen({ token, currentUser, onLogout }) {
             if (!isViewingThisChat) {
               setUnreadCounts(prev => ({ ...prev, [`dm_${fromId}`]: (prev[`dm_${fromId}`] || 0) + 1 }));
             }
-            // Fire local notification when not viewing that chat
             if (notifRef.current && !isViewingThisChat) {
-              const sender = msg.from_user?.username || msg.fromUsername || 'Someone';
+              const sender = pl.from_user?.username || pl.from_username || 'Someone';
               let preview;
-              if (isEncryptedDM(msg.content))                          preview = 'New encrypted message';
-              else if (typeof msg.content === 'string' && msg.content.startsWith('data:')) preview = '[Image]';
-              else                                                     preview = (msg.content || '').slice(0, 80);
-              showLocalNotification(`nano-SYNAPSYS \u2014 ${sender}`, preview);
+              if (isEncryptedDM(pl.content))                                              preview = 'New encrypted message';
+              else if (typeof pl.content === 'string' && pl.content.startsWith('data:')) preview = '[Image]';
+              else                                                                         preview = (pl.content || '').slice(0, 80);
+              showLocalNotification(`nano-SYNAPSYS — ${sender}`, preview);
             }
           }
         }
 
-        if (msg.type === 'group_message') {
-          const fromId = String(msg.from_user?.id ?? msg.from_user);
-          const meId   = String(currentUser.id);
+        // ── Group: Phoenix emits "group.message" on topic "group:<group_id>" ──
+        if (evtName === 'group.message') {
+          // Server payload: { id, group_id, from_user, from_username, from_display, content, created_at }
+          const msg = { ...pl, type: 'group_message' };
+          setIncomingMsg(msg);
+
+          const fromId  = String(pl.from_user?.id ?? pl.from_user);
+          const meId    = String(currentUser.id);
+          const groupId = pl.group_id ?? topic?.split(':')?.[1];
           if (fromId !== meId) {
-            const groupId = msg.group_id ?? msg.group?.id;
             const isViewingThisGroup =
               activeTabRef.current === 'GROUPS' &&
               groupChatRef.current !== null &&
@@ -4468,19 +4529,21 @@ function HomeScreen({ token, currentUser, onLogout }) {
               setUnreadCounts(prev => ({ ...prev, [`group_${groupId}`]: (prev[`group_${groupId}`] || 0) + 1 }));
             }
             if (notifRef.current && !isViewingThisGroup) {
-              const sender = msg.from_display || msg.from_username || 'Group';
+              const sender = pl.from_display || pl.from_username || 'Group';
               let preview;
-              if (isEncryptedGroup(msg.content))                          preview = 'New encrypted message';
-              else if (typeof msg.content === 'string' && msg.content.startsWith('data:')) preview = '[Image]';
-              else                                                        preview = (msg.content || '').slice(0, 80);
-              showLocalNotification(`nano-SYNAPSYS — ${msg.group?.name || 'Group'}`, `${sender}: ${preview}`);
+              if (isEncryptedGroup(pl.content))                                             preview = 'New encrypted message';
+              else if (typeof pl.content === 'string' && pl.content.startsWith('data:'))   preview = '[Image]';
+              else                                                                          preview = (pl.content || '').slice(0, 80);
+              showLocalNotification(`nano-SYNAPSYS — Group`, `${sender}: ${preview}`);
             }
           }
         }
       } catch {}
     };
+
     ws.onerror  = () => {};
     ws.onclose  = () => {
+      if (ws._heartbeat) clearInterval(ws._heartbeat);
       const delay = Math.min(backoffRef.current, 30000);
       backoffRef.current = Math.min(backoffRef.current * 2, 30000);
       reconnectRef.current = setTimeout(connectWS, delay);
