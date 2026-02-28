@@ -5515,7 +5515,7 @@ function HomeScreen({ token, currentUser, onLogout }) {
       <View style={styles.homeHeader}>
         <View>
           <Text style={styles.homeTitle}>SYNAPTYC</Text>
-          <Text style={styles.homeSubtitle}>by AI EVOLUTION</Text>
+          <Text style={styles.homeSubtitle}>by nano-SYNAPSYS</Text>
         </View>
         <TouchableOpacity onPress={() => { setShowSearch(true); setSearchQuery(''); }} style={{ padding: 8 }}>
           <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 28, color: C.accent }}>⌕</Text>
