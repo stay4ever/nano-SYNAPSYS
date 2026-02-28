@@ -1,7 +1,7 @@
 // Polyfill crypto.getRandomValues — MUST be first import (required by tweetnacl / @noble/hashes in RN)
 import 'react-native-get-random-values';
 /**
- * nano-SYNAPSYS
+ * SYNAPTYC
  * AI Evolution secure messaging + bot client
  * React Native (Expo) — single-file architecture
  */
@@ -1917,7 +1917,7 @@ function BiometricUnlockScreen({ onUnlock, onUsePassword }) {
     setLoading(true); setErr('');
     try {
       const result = await LocalAuthentication.authenticateAsync({
-        promptMessage:         'Unlock nano-SYNAPSYS',
+        promptMessage:         'Unlock SYNAPTYC',
         // Allow device passcode as fallback so iOS can clear any Face ID lockout
         // caused by repeated failed attempts. iOS tries Face ID first; if it
         // fails or is locked it shows the device passcode prompt automatically.
@@ -1952,7 +1952,7 @@ function BiometricUnlockScreen({ onUnlock, onUsePassword }) {
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <View style={styles.centerFill}>
         <Image source={require('./assets/icon.png')} style={{ width: 96, height: 96, borderRadius: 22, marginBottom: 10 }} resizeMode="contain" />
-        <Text style={[styles.logoText, { fontSize: 18, letterSpacing: 3 }]}>nano-SYNAPSYS</Text>
+        <Text style={[styles.logoText, { fontSize: 18, letterSpacing: 3 }]}>SYNAPTYC</Text>
         <Text style={styles.logoSub}>BY AI EVOLUTION</Text>
         <View style={{ height: 48 }} />
         <TouchableOpacity onPress={() => tryBiometric(false)} disabled={loading} activeOpacity={0.7}>
@@ -2037,7 +2037,7 @@ function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
       if (!enr) { setErr('Face ID is not set up. Go to iOS Settings → Face ID & Passcode.'); return; }
 
       const result = await LocalAuthentication.authenticateAsync({
-        promptMessage: 'Login to nano-SYNAPSYS', disableDeviceFallback: true, cancelLabel: 'Cancel',
+        promptMessage: 'Login to SYNAPTYC', disableDeviceFallback: true, cancelLabel: 'Cancel',
       });
       if (!result.success) {
         if (result.error === 'user_cancel' || result.error === 'system_cancel') { return; }
@@ -2172,7 +2172,7 @@ function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
             style={{ width: 96, height: 96, borderRadius: 22, marginBottom: 10 }}
             resizeMode="contain"
           />
-          <Text style={[styles.logoText, { fontSize: 18, letterSpacing: 3 }]}>nano-SYNAPSYS</Text>
+          <Text style={[styles.logoText, { fontSize: 18, letterSpacing: 3 }]}>SYNAPTYC</Text>
           <Text style={styles.logoSub}>BY AI EVOLUTION</Text>
         </View>
 
@@ -2592,7 +2592,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
   const findOnApp = async (contact) => {
     const q = contact.name.split(' ')[0];
     if (q.length < 2) {
-      Alert.alert('NOT ON APP YET', `"${contact.name}" doesn't appear to be on nano-SYNAPSYS.\n\nSend them an invite?`, [
+      Alert.alert('NOT ON APP YET', `"${contact.name}" doesn't appear to be on SYNAPTYC.\n\nSend them an invite?`, [
         { text: 'CANCEL', style: 'cancel' },
         { text: 'SEND INVITE', onPress: () => sendSMSInvite(contact) },
       ]);
@@ -2606,7 +2606,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
 
       if (all.length === 0) {
         Alert.alert('NOT ON APP YET',
-          `"${contact.name}" doesn't have nano-SYNAPSYS.\n\nSend them an invite?`,
+          `"${contact.name}" doesn't have SYNAPTYC.\n\nSend them an invite?`,
           [{ text: 'CANCEL', style: 'cancel' }, { text: 'SEND INVITE', onPress: () => sendSMSInvite(contact) }]);
       } else if (newOnes.length === 0) {
         await saveStatus(contact.phone, { s: 'c' });
@@ -2641,8 +2641,8 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
       const tkMatch    = inviteUrl.match(/[?&]invite=([A-Za-z0-9_=-]+)/);
       const deepLink   = tkMatch ? `nanosynapsys://join/${tkMatch[1]}` : null;
       const msg = deepLink
-        ? `${senderName} invited you to nano-SYNAPSYS.\n\n1. Download: https://apps.apple.com/app/id6759710350\n2. Tap to join: ${deepLink}\n\nOr open: ${inviteUrl}\n\nLink expires in 25 minutes — one-time use.`
-        : `${senderName} invited you to nano-SYNAPSYS. Join here: ${inviteUrl}\n(Expires in 25 min, one-time use)`;
+        ? `${senderName} invited you to SYNAPTYC.\n\n1. Download: https://apps.apple.com/app/id6759710350\n2. Tap to join: ${deepLink}\n\nOr open: ${inviteUrl}\n\nLink expires in 25 minutes — one-time use.`
+        : `${senderName} invited you to SYNAPTYC. Join here: ${inviteUrl}\n(Expires in 25 min, one-time use)`;
 
       // Strip all non-digit chars except leading + for international numbers
       const phone = (contact.phone || '').replace(/(?!^\+)[^\d]/g, '');
@@ -2729,7 +2729,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
                 CONTACTS PERMISSION DENIED
               </Text>
               <Text style={{ fontFamily: mono, fontSize: 10, color: C.dim, textAlign: 'center', lineHeight: 16 }}>
-                {'Enable contacts access in:\nSettings → nano-SYNAPSYS → Contacts'}
+                {'Enable contacts access in:\nSettings → SYNAPTYC → Contacts'}
               </Text>
               <TouchableOpacity
                 onPress={() => Linking.openURL('app-settings:')}
@@ -4745,8 +4745,8 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
       const inviteToken = tokenMatch ? tokenMatch[1] : null;
       const deepLink = inviteToken ? `nanosynapsys://join/${inviteToken}` : null;
       const msg = deepLink
-        ? `${senderName} invited you to nano-SYNAPSYS — private encrypted messaging.\n\n1. Download the app: https://apps.apple.com/app/id6759710350\n2. Open this link to join: ${deepLink}\n\nOr register at: ${inviteUrl}\n(One-use invite, expires in 25 minutes)`
-        : `${senderName} invited you to nano-SYNAPSYS — private encrypted messaging by AI Evolution. Join here: ${inviteUrl} (expires in 25 minutes, one-use only)`;
+        ? `${senderName} invited you to SYNAPTYC — private encrypted messaging.\n\n1. Download the app: https://apps.apple.com/app/id6759710350\n2. Open this link to join: ${deepLink}\n\nOr register at: ${inviteUrl}\n(One-use invite, expires in 25 minutes)`
+        : `${senderName} invited you to SYNAPTYC — private encrypted messaging by AI Evolution. Join here: ${inviteUrl} (expires in 25 minutes, one-use only)`;
 
       // Normalize phone number — strip whitespace/formatting
       const phone = (contact.phone || '').replace(/\s+/g, '');
@@ -4805,7 +4805,7 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
       // Name too short to search — skip to invite
       Alert.alert(
         'INVITE TO APP',
-        `"${contact.name}" is not on nano-SYNAPSYS yet.\n\nSend them an invite link via SMS?`,
+        `"${contact.name}" is not on SYNAPTYC yet.\n\nSend them an invite link via SMS?`,
         [
           { text: 'CANCEL', style: 'cancel' },
           { text: 'SEND INVITE', onPress: () => sendSMSInvite(contact) },
@@ -4823,7 +4823,7 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
         // Genuinely not on the app — offer invite
         Alert.alert(
           'NOT ON APP YET',
-          `"${contact.name}" doesn't have nano-SYNAPSYS.\n\nSend them an invite? They'll be added to your contacts automatically when they join.`,
+          `"${contact.name}" doesn't have SYNAPTYC.\n\nSend them an invite? They'll be added to your contacts automatically when they join.`,
           [
             { text: 'CANCEL', style: 'cancel' },
             { text: 'SEND INVITE', onPress: () => sendSMSInvite(contact) },
@@ -5417,7 +5417,7 @@ function HomeScreen({ token, currentUser, onLogout }) {
               if (isEncryptedDM(pl.content))                                              preview = 'New encrypted message';
               else if (typeof pl.content === 'string' && pl.content.startsWith('data:')) preview = '[Image]';
               else                                                                         preview = (pl.content || '').slice(0, 80);
-              showLocalNotification(`nano-SYNAPSYS — ${sender}`, preview);
+              showLocalNotification(`SYNAPTYC — ${sender}`, preview);
             }
           }
         }
@@ -5445,7 +5445,7 @@ function HomeScreen({ token, currentUser, onLogout }) {
               if (isEncryptedGroup(pl.content))                                             preview = 'New encrypted message';
               else if (typeof pl.content === 'string' && pl.content.startsWith('data:'))   preview = '[Image]';
               else                                                                          preview = (pl.content || '').slice(0, 80);
-              showLocalNotification(`nano-SYNAPSYS — Group`, `${sender}: ${preview}`);
+              showLocalNotification(`SYNAPTYC — Group`, `${sender}: ${preview}`);
             }
           }
         }
@@ -5512,7 +5512,7 @@ function HomeScreen({ token, currentUser, onLogout }) {
       <View style={styles.homeHeader}>
         <View>
           <Text style={styles.homeTitle}>SYNAPTYC</Text>
-          <Text style={styles.homeSubtitle}>by nano-SYNAPSYS</Text>
+          <Text style={styles.homeSubtitle}>by AI EVOLUTION</Text>
         </View>
         <TouchableOpacity onPress={() => { setShowSearch(true); setSearchQuery(''); }} style={{ padding: 8 }}>
           <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 28, color: C.accent }}>⌕</Text>
@@ -5679,7 +5679,7 @@ function AppInner() {
     return (
       <ThemedView style={styles.splashScreen}>
         <StatusBar barStyle="light-content" backgroundColor={C.bg} />
-        <Text style={styles.splashTitle}>nano-SYNAPSYS</Text>
+        <Text style={styles.splashTitle}>SYNAPTYC</Text>
         <Text style={styles.splashSub}>AI EVOLUTION</Text>
         <Spinner size="large" />
       </ThemedView>
