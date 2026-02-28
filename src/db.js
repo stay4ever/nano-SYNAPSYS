@@ -53,32 +53,10 @@ async function openDb() {
     ON messages(convo_key, created_at)
   `);
 
-  // FTS5 full-text search table (content= = external content table)
+  // Full-text search index on content column (LIKE-based; no FTS5 required)
   await _db.executeAsync(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
-    USING fts5(
-      content,
-      convo_key UNINDEXED,
-      id        UNINDEXED,
-      content='messages',
-      content_rowid='id'
-    )
-  `);
-
-  // FTS triggers to keep the virtual table in sync
-  await _db.executeAsync(`
-    CREATE TRIGGER IF NOT EXISTS messages_ai
-    AFTER INSERT ON messages BEGIN
-      INSERT INTO messages_fts(rowid, content, convo_key, id)
-        VALUES (new.id, new.content, new.convo_key, new.id);
-    END
-  `);
-  await _db.executeAsync(`
-    CREATE TRIGGER IF NOT EXISTS messages_ad
-    AFTER DELETE ON messages BEGIN
-      INSERT INTO messages_fts(messages_fts, rowid, content, convo_key, id)
-        VALUES ('delete', old.id, old.content, old.convo_key, old.id);
-    END
+    CREATE INDEX IF NOT EXISTS idx_msg_content
+    ON messages(content)
   `);
 
   // Sync cursors — track last seen message ID per conversation
@@ -150,22 +128,20 @@ async function updateCursor(convoKey, maxMsgId) {
 }
 
 /**
- * Full-text search across all conversations.
- * Returns array of { id, convo_key, content, created_at } ordered by relevance.
+ * Search messages using LIKE (no FTS5 required).
+ * Returns array of { id, convo_key, content, from_id, created_at } ordered by date.
  */
 async function searchMessages(query) {
   if (!query || !query.trim()) return [];
   const db = await openDb();
-  // Escape FTS5 special chars
-  const safe = query.trim().replace(/['"*()]/g, ' ');
+  const pattern = `%${query.trim().replace(/[%_]/g, '\\$&')}%`;
   const result = await db.executeAsync(
-    `SELECT m.id, m.convo_key, m.content, m.from_id, m.created_at
-     FROM messages_fts fts
-     JOIN messages m ON fts.rowid = m.id
-     WHERE messages_fts MATCH ?
-     ORDER BY rank
+    `SELECT id, convo_key, content, from_id, created_at
+     FROM messages
+     WHERE content LIKE ? ESCAPE '\\'
+     ORDER BY created_at DESC
      LIMIT 50`,
-    [`"${safe}"*`]
+    [pattern]
   );
   return result?.rows?._array ?? result?.rows ?? [];
 }
