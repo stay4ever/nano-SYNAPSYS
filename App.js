@@ -41,6 +41,7 @@ import * as SecureStore from 'expo-secure-store';
 import * as Clipboard from 'expo-clipboard';
 import * as LocalAuthentication from 'expo-local-authentication';
 import * as ImagePicker from 'expo-image-picker';
+import * as FileSystem from 'expo-file-system';
 import * as Location from 'expo-location';
 import * as Contacts from 'expo-contacts';
 import * as SMS from 'expo-sms';
@@ -80,6 +81,9 @@ const GREEN_C = {
   green:       '#00C832',
   amber:       '#f59e0b',
   red:         '#ef4444',
+  accentFaint: 'rgba(0,255,65,0.07)',
+  accentDim:   'rgba(0,255,65,0.15)',
+  accentMid:   'rgba(0,255,65,0.30)',
 };
 
 const TACTICAL_C = {
@@ -96,6 +100,9 @@ const TACTICAL_C = {
   green:       '#6888a0',
   amber:       '#b89060',
   red:         '#c04848',
+  accentFaint: 'rgba(168,184,204,0.07)',
+  accentDim:   'rgba(168,184,204,0.15)',
+  accentMid:   'rgba(168,184,204,0.30)',
 };
 
 // ---------------------------------------------------------------------------
@@ -2455,6 +2462,8 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
   const [phoneStatuses,   setPhoneStatuses]   = useState({});
   const [inviting,        setInviting]        = useState(null);
   const [appContactIds,   setAppContactIds]   = useState(new Set());
+  const [autoMatchedMap,  setAutoMatchedMap]  = useState({});   // phone → app user (auto-detected)
+  const [autoSearching,   setAutoSearching]   = useState(false);
   const [toast,           setToast]           = useState('');   // inline feedback bar
   const toastTimer = useRef(null);
 
@@ -2513,12 +2522,36 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
         .filter(c => c.phone)
         .sort((a, b) => a.name.localeCompare(b.name));
       setDeviceContacts(list);
+      // Auto-search in background — no await, silent fail
+      autoSearchContacts(list).catch(() => {});
     } catch (e) {
       setContactsErr('Could not load contacts: ' + (e?.message || String(e)));
     } finally {
       setContactsLoading(false);
       setRefreshing(false);
     }
+  };
+
+  // Auto-detect which contacts are on the app (runs silently in background)
+  const autoSearchContacts = async (contacts) => {
+    setAutoSearching(true);
+    const todo = contacts.slice(0, 50); // cap at 50 to stay responsive
+    const results = await Promise.allSettled(todo.map(async (c) => {
+      const q = c.name.split(' ')[0].trim();
+      if (q.length < 2) return null;
+      try {
+        const data = await api(`/api/users/search?q=${encodeURIComponent(q)}`, 'GET', null, token);
+        const all = Array.isArray(data) ? data : [];
+        if (all.length === 0) return null;
+        // Prefer already-known contact; accept single unambiguous match
+        const match = all.find(u => appContactIds.has(u.id)) ?? (all.length === 1 ? all[0] : null);
+        return match ? { phone: c.phone, user: match } : null;
+      } catch { return null; }
+    }));
+    const map = {};
+    results.forEach(r => { if (r.status === 'fulfilled' && r.value) map[r.value.phone] = r.value.user; });
+    setAutoMatchedMap(map);
+    setAutoSearching(false);
   };
 
   const getPhoneStatus = (phone) => {
@@ -2721,16 +2754,34 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
               ) : null}
               renderItem={({ item: c }) => {
                 const ps = getPhoneStatus(c.phone);
-                const ledColor = ps === 'c' ? C.accent : ps === 'i' ? C.amber : C.red;
+                const matched = autoMatchedMap[c.phone];
+                const onApp = !!matched;
+                const ledColor = ps === 'c' ? C.accent : ps === 'i' ? C.amber : onApp ? C.green : C.red;
                 return (
                   <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: C.border }}>
                     <View style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: ledColor, marginRight: 12, flexShrink: 0 }} />
                     <View style={{ flex: 1 }}>
                       <Text style={{ fontFamily: mono, fontSize: 13, color: C.bright }}>{c.name}</Text>
                       <Text style={{ fontFamily: mono, fontSize: 10, color: C.dim }}>{c.phone}</Text>
+                      {onApp && ps !== 'c' && (
+                        <Text style={{ fontFamily: mono, fontSize: 9, color: C.green, marginTop: 1 }}>
+                          ON APP · {matched.display_name || matched.displayName || matched.username}
+                        </Text>
+                      )}
                     </View>
                     {ps === 'c' ? (
-                      <Text style={{ fontFamily: mono, fontSize: 10, color: C.accent }}>✓ CONTACT</Text>
+                      /* Green: already a contact — show MESSAGE button */
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                        <Text style={{ fontFamily: mono, fontSize: 10, color: C.accent }}>✓</Text>
+                        {onApp && (
+                          <TouchableOpacity
+                            style={{ borderWidth: 1, borderColor: C.accent, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 3 }}
+                            onPress={() => { onClose(); onOpenDM(matched); }}
+                          >
+                            <Text style={{ fontFamily: mono, fontSize: 10, color: C.accent }}>MSG</Text>
+                          </TouchableOpacity>
+                        )}
+                      </View>
                     ) : ps === 'i' ? (
                       /* Amber: invite pending — allow cancelling and resending */
                       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
@@ -2751,8 +2802,24 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
                           <Text style={{ fontFamily: mono, fontSize: 9, color: C.dim }}>✕</Text>
                         </TouchableOpacity>
                       </View>
+                    ) : onApp ? (
+                      /* Auto-detected on app — offer MSG + ADD */
+                      <View style={{ flexDirection: 'row', gap: 6 }}>
+                        <TouchableOpacity
+                          style={{ borderWidth: 1, borderColor: C.accent, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 3 }}
+                          onPress={() => { onClose(); onOpenDM(matched); }}
+                        >
+                          <Text style={{ fontFamily: mono, fontSize: 10, color: C.accent }}>MSG</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={{ borderWidth: 1, borderColor: C.green, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 3 }}
+                          onPress={() => addContact(matched.id, c.phone)}
+                        >
+                          <Text style={{ fontFamily: mono, fontSize: 10, color: C.green }}>ADD</Text>
+                        </TouchableOpacity>
+                      </View>
                     ) : (
-                      /* Red: not connected — offer FIND + INVITE */
+                      /* Red: not detected — offer FIND + INVITE */
                       <View style={{ flexDirection: 'row', gap: 6 }}>
                         <TouchableOpacity
                           style={{ borderWidth: 1, borderColor: C.accent, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 3 }}
@@ -2867,9 +2934,9 @@ function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
             <TouchableOpacity
               style={{
                 width: cardW,
-                backgroundColor: 'rgba(0,255,65,0.07)',
+                backgroundColor: C.accentFaint,
                 borderWidth: 1,
-                borderColor: 'rgba(0,255,65,0.15)',
+                borderColor: C.accentDim,
                 borderRadius: 16,
                 padding: 12,
                 alignItems: 'center',
@@ -3175,7 +3242,6 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
 
   return (
     <ThemedSafeArea>
-      <View style={styles.flex} {...swipeBackDM.panHandlers}>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <AppHeader title={peer.display_name || peer.displayName || peer.username} onBack={onBack} />
       {disappear && (
@@ -3185,7 +3251,7 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
           </Text>
         </View>
       )}
-      <KeyboardAvoidingView style={styles.flex} behavior={KAV_BEHAVIOR}>
+      <KeyboardAvoidingView style={styles.flex} behavior={KAV_BEHAVIOR} {...swipeBackDM.panHandlers}>
         {loading ? <View style={styles.centerFill}><Spinner size="large" /></View> : (
           <>
             <ErrText msg={err} />
@@ -3255,7 +3321,6 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
           </>
         )}
       </KeyboardAvoidingView>
-      </View>
     </ThemedSafeArea>
   );
 }
@@ -3393,9 +3458,9 @@ function GroupsTab({ token, onOpenGroup, unread = {} }) {
             <TouchableOpacity
               style={{
                 width: cardW2,
-                backgroundColor: 'rgba(0,255,65,0.07)',
+                backgroundColor: C.accentFaint,
                 borderWidth: 1,
-                borderColor: 'rgba(0,255,65,0.15)',
+                borderColor: C.accentDim,
                 borderRadius: 16,
                 padding: 12,
                 alignItems: 'center',
@@ -3437,9 +3502,9 @@ function GroupsTab({ token, onOpenGroup, unread = {} }) {
                 alignItems: 'center', justifyContent: 'center',
                 marginBottom: 8,
                 borderWidth: 2,
-                borderColor: 'rgba(0,255,65,0.3)',
+                borderColor: C.accentMid,
               }}>
-                <Text style={{ color: '#00ff41', fontSize: 24, fontWeight: '700', fontFamily: mono2 }}>{initials}</Text>
+                <Text style={{ color: C.accent, fontSize: 24, fontWeight: '700', fontFamily: mono2 }}>{initials}</Text>
               </View>
 
               {/* Name */}
@@ -3450,7 +3515,7 @@ function GroupsTab({ token, onOpenGroup, unread = {} }) {
 
               {/* Admin badge */}
               {isAdmin && (
-                <View style={{ marginTop: 6, backgroundColor: 'rgba(0,255,65,0.15)', borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 }}>
+                <View style={{ marginTop: 6, backgroundColor: C.accentDim, borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 }}>
                   <Text style={{ fontFamily: mono2, fontSize: 8, color: C.accent, letterSpacing: 1 }}>ADMIN</Text>
                 </View>
               )}
@@ -3543,8 +3608,10 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
     if (incomingMsg.type === 'group_message' &&
         String(incomingMsg.group?.id ?? incomingMsg.group_id) === String(group.id)) {
       setMessages((prev) => {
-        const exists = prev.some((m) => m.id === incomingMsg.id);
-        return exists ? prev : [...prev, incomingMsg];
+        const fromMe = String(incomingMsg.from_id ?? incomingMsg.from_user?.id) === String(currentUser.id);
+        // Remove any temp (optimistic) messages from self when real echo arrives
+        const base = fromMe ? prev.filter(m => !m._temp) : prev;
+        return base.some(m => m.id === incomingMsg.id) ? base : [...base, incomingMsg];
       });
       if (incomingMsg.disappear_after && incomingMsg.disappear_after > 0) {
         const msgId = incomingMsg.id;
@@ -3616,7 +3683,12 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
       if (!isImage && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && wsRef.current._phxSend) {
         wsRef.current._phxJoin(`group:${group.id}`);
         wsRef.current._phxSend(`group:${group.id}`, 'group_message', { content: payload });
-        // No optimistic push — the server echoes the message back via WS
+        // Optimistic push — show plaintext immediately; server echo will replace temp on arrival
+        const tempId = `temp_${Date.now()}`;
+        setMessages(prev => [...prev, {
+          id: tempId, from_id: String(currentUser.id),
+          from_user: currentUser, content, created_at: new Date().toISOString(), _temp: true,
+        }]);
       } else {
         const msg = await api(`/api/groups/${group.id}/messages`, 'POST', { content: payload }, token);
         setMessages((prev) => prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]);
@@ -3693,7 +3765,6 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
 
   return (
     <ThemedSafeArea>
-      <View style={styles.flex} {...swipeBackGroup.panHandlers}>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <AppHeader
         title={group.name}
@@ -3711,7 +3782,7 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
         visible={showMembers}
         onClose={() => setShowMembers(false)}
       />
-      <KeyboardAvoidingView style={styles.flex} behavior={KAV_BEHAVIOR}>
+      <KeyboardAvoidingView style={styles.flex} behavior={KAV_BEHAVIOR} {...swipeBackGroup.panHandlers}>
         {loading ? <View style={styles.centerFill}><Spinner size="large" /></View> : (
           <>
             <ErrText msg={err} />
@@ -3777,7 +3848,6 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
           </>
         )}
       </KeyboardAvoidingView>
-      </View>
     </ThemedSafeArea>
   );
 }
@@ -4187,10 +4257,24 @@ function ProfileTab({ token, currentUser, onLogout }) {
       allowsEditing: true, aspect: [1, 1], quality: 0.8,
     });
     if (!res.canceled && res.assets?.[0]?.uri) {
-      const uri = res.assets[0].uri;
-      setProfileImageUri(uri);
-      await SecureStore.setItemAsync(PROFILE_IMAGE_KEY, uri);
+      const srcUri = res.assets[0].uri;
+      // Copy to a permanent location so the URI survives app restarts
+      const destUri = FileSystem.documentDirectory + 'profile_avatar.jpg';
+      await FileSystem.copyAsync({ from: srcUri, to: destUri });
+      setProfileImageUri(destUri);
+      await SecureStore.setItemAsync(PROFILE_IMAGE_KEY, destUri);
     }
+  };
+
+  const handleSaveDisplayName = async () => {
+    if (!displayName.trim()) return;
+    try {
+      const ext = { displayName: displayName.trim(), phone, residentialAddr, workAddr };
+      await saveProfileExt(ext);
+      try { await api('/api/profile', 'PATCH', { display_name: displayName.trim() }, token); } catch {}
+      setSaveProfileOk('NAME SAVED');
+      setTimeout(() => setSaveProfileOk(''), 2000);
+    } catch (e) { setSaveProfileErr(e.message); }
   };
 
   const handleSaveProfile = async () => {
@@ -4281,7 +4365,10 @@ function ProfileTab({ token, currentUser, onLogout }) {
         }
         <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, marginTop: 6, letterSpacing: 0.5 }}>tap to change photo</Text>
       </TouchableOpacity>
-      <Text style={{ fontFamily: mono, fontSize: 16, fontWeight: '700', color: C.text, textAlign: 'center', letterSpacing: 1, marginBottom: 4 }}>{displayName || currentUser.display_name || currentUser.displayName || currentUser.username}</Text>
+      <TouchableOpacity onLongPress={handleSaveDisplayName} delayLongPress={600} activeOpacity={0.75} style={{ alignItems: 'center', marginBottom: 4 }}>
+        <Text style={{ fontFamily: mono, fontSize: 16, fontWeight: '700', color: C.text, textAlign: 'center', letterSpacing: 1 }}>{displayName || currentUser.display_name || currentUser.displayName || currentUser.username}</Text>
+        <Text style={{ fontFamily: mono, fontSize: 9, color: C.dim, letterSpacing: 1, marginTop: 2 }}>HOLD TO SAVE NAME</Text>
+      </TouchableOpacity>
       <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, textAlign: 'center', letterSpacing: 1, marginBottom: 16 }}>@{currentUser.username}</Text>
 
       {/* ── READ-ONLY INFO ──────────────────────────────────────────── */}
@@ -5428,7 +5515,7 @@ function HomeScreen({ token, currentUser, onLogout }) {
           <Text style={styles.homeSubtitle}>by nano-SYNAPSYS</Text>
         </View>
         <TouchableOpacity onPress={() => { setShowSearch(true); setSearchQuery(''); }} style={{ padding: 8 }}>
-          <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 22, color: C.accent }}>⌕</Text>
+          <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 28, color: C.accent }}>⌕</Text>
         </TouchableOpacity>
       </View>
 
