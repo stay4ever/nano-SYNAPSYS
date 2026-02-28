@@ -3636,12 +3636,15 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
       for (const msg of messages) {
         if (isEncryptedGroup(msg.content)) {
           const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? '');
-          const plain = await decryptGroupMsg(msg.content, null, sid, group.id);
-          const resolved = plain ?? '[Encrypted — cannot decrypt]';
-          updates[msg.id] = resolved;
-          // Persist to local DB
-          if (plain !== null) {
-            DB.persistMessage(`group_${group.id}`, msg.id, sid, plain, msg.created_at).catch(() => {});
+          try {
+            const plain = await decryptGroupMsg(msg.content, null, sid, group.id);
+            const resolved = plain ?? '[Encrypted — cannot decrypt]';
+            updates[msg.id] = resolved;
+            if (plain !== null) {
+              DB.persistMessage(`group_${group.id}`, msg.id, sid, plain, msg.created_at).catch(() => {});
+            }
+          } catch {
+            updates[msg.id] = '[Encrypted — cannot decrypt]';
           }
         }
         // Trigger media decryption for any message whose resolved content is a media payload
@@ -4020,8 +4023,8 @@ function BotTab({ token, wsRef }) {
     typingTimer.current = setTimeout(async () => {
       try {
         const [calendar_events, phone_contacts] = await Promise.all([
-          getCalendarEvents(),
-          getPhoneContacts(),
+          getCalendarEvents().catch(() => []),
+          getPhoneContacts().catch(() => []),
         ]);
         const body = {
           message: content || 'Describe this image.',
@@ -4258,8 +4261,8 @@ function ProfileTab({ token, currentUser, onLogout }) {
     });
     if (!res.canceled && res.assets?.[0]?.uri) {
       const srcUri = res.assets[0].uri;
-      // Copy to a permanent location so the URI survives app restarts
-      const destUri = FileSystem.documentDirectory + 'profile_avatar.jpg';
+      // Unique filename busts React Native image cache; permanent path survives restarts
+      const destUri = FileSystem.documentDirectory + `profile_avatar_${Date.now()}.jpg`;
       await FileSystem.copyAsync({ from: srcUri, to: destUri });
       setProfileImageUri(destUri);
       await SecureStore.setItemAsync(PROFILE_IMAGE_KEY, destUri);
