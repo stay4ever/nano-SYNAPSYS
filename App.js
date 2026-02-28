@@ -660,6 +660,10 @@ const BANNER_PERM_MSGS_KEY = 'banner_perm_msgs';
 const BANNER_PERM_SEND_KEY = 'banner_perm_send';
 const BANNER_PERM_CAL_KEY  = 'banner_perm_cal';
 const BANNER_PERM_CON_KEY  = 'banner_perm_con';
+// Phase 5 keys
+const DEVICE_ID_KEY      = 'nano_device_id';        // UUID, never changes
+const SKIP_AUTH_KEY      = 'nano_skip_auth';         // Unix ms expiry timestamp
+const BANNER_ENABLED_KEY = 'nano_banner_enabled';    // '1' | '0'
 
 const DISAPPEAR_OPTIONS = [
   { label: 'OFF',     value: null   },
@@ -1231,6 +1235,21 @@ async function loadLocation() {
   } catch { return null; }
 }
 
+/** Returns the persistent device UUID, creating and storing it on first call. */
+async function getOrCreateDeviceId() {
+  let id = await SecureStore.getItemAsync(DEVICE_ID_KEY);
+  if (!id) {
+    id = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = (Math.random() * 16) | 0;
+      return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+    });
+    await SecureStore.setItemAsync(DEVICE_ID_KEY, id);
+  }
+  return id;
+}
+async function saveBannerEnabled(v) { await SecureStore.setItemAsync(BANNER_ENABLED_KEY, v ? '1' : '0'); }
+async function loadBannerEnabled() { return (await SecureStore.getItemAsync(BANNER_ENABLED_KEY)) !== '0'; }
+
 // ---------------------------------------------------------------------------
 // FORMAT HELPERS
 // ---------------------------------------------------------------------------
@@ -1725,11 +1744,11 @@ const ICON_COMPONENTS = {
 // ---------------------------------------------------------------------------
 const TABS = ['CHATS', 'GROUPS', 'BOT', 'PROFILE', 'SETTINGS'];
 
-function TabBar({ active, onChange, unread = {} }) {
+function TabBar({ active, onChange, unread = {}, tabs = TABS }) {
   const { styles, C } = useSkin();
   return (
     <View style={styles.tabBar}>
-      {TABS.map((tab) => {
+      {tabs.map((tab) => {
         const isActive = tab === active;
         const IconComp = ICON_COMPONENTS[tab];
         const cnt = unread[tab] || 0;
@@ -1946,47 +1965,59 @@ function BiometricUnlockScreen({ onUnlock, onUsePassword }) {
 }
 
 // ---------------------------------------------------------------------------
-// AUTH SCREEN
+// AUTH SCREEN — PIN keypad (device-linked 6-digit PIN)
 // ---------------------------------------------------------------------------
 function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
   const { styles, C } = useSkin();
   const mono = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
-  const logoScale = useRef(new Animated.Value(1)).current;
-  const animateLogo = (small) => Animated.timing(logoScale, {
-    toValue: small ? 0.62 : 1, duration: 240, useNativeDriver: true,
-  }).start();
-  const [tab, setTab]                 = useState('LOGIN');
-  const [username, setUsername]       = useState('');
-  const [email, setEmail]             = useState('');
-  const [password, setPassword]       = useState('');
-  const [loading, setLoading]         = useState(false);
-  const [err, setErr]                 = useState('');
+
+  // flow: 'login' | 'register_name' | 'register_pin' | 'register_confirm'
+  //       'forgot_name' | 'forgot_pin' | 'forgot_confirm'
+  const [flow,         setFlow]         = useState(inviteToken ? 'register_name' : 'login');
+  const [username,     setUsername]     = useState('');
+  const [pin,          setPin]          = useState('');
+  const [confirmPin,   setConfirmPin]   = useState('');
+  const [loading,      setLoading]      = useState(false);
+  const [err,          setErr]          = useState('');
   const [bioSupported, setBioSupported] = useState(false);
-  const [bioReady, setBioReady]         = useState(false);
-  const [bioLoading, setBioLoading]     = useState(false);
-  const [showReset, setShowReset]       = useState(false);
-  const [resetEmail, setResetEmail]     = useState('');
-  const [resetLoading, setResetLoading] = useState(false);
-  const [resetMsg, setResetMsg]         = useState('');
+  const [bioReady,     setBioReady]     = useState(false);
+  const [bioLoading,   setBioLoading]   = useState(false);
+  const [deviceId,     setDeviceId]     = useState('');
 
   useEffect(() => {
     (async () => {
-      const supported     = await isBiometricReady();
-      const enabled       = await loadBioEnabled();
-      const refreshToken  = await loadBioRefresh();
+      const id         = await getOrCreateDeviceId();
+      const supported  = await isBiometricReady();
+      const enabled    = await loadBioEnabled();
+      const refreshTok = await loadBioRefresh();
+      setDeviceId(id);
       setBioSupported(supported);
-      setBioReady(supported && enabled && !!refreshToken);
+      setBioReady(supported && enabled && !!refreshTok);
     })();
   }, []);
 
-  // Auto-switch to register tab when arriving via an invite link
   useEffect(() => {
-    if (inviteToken && inviterName) setTab('REGISTER');
+    if (inviteToken && inviterName) setFlow('register_name');
   }, [inviteToken, inviterName]);
 
-  const reset = () => { setUsername(''); setEmail(''); setPassword(''); setErr(''); };
-  const handleTabSwitch = (t) => { setTab(t); reset(); };
+  // ── Digit input helpers ──────────────────────────────────────────────────
+  const appendDigit = useCallback((d) => {
+    if (flow === 'register_confirm' || flow === 'forgot_confirm') {
+      setConfirmPin(p => p.length < 6 ? p + d : p);
+    } else {
+      setPin(p => p.length < 6 ? p + d : p);
+    }
+  }, [flow]);
 
+  const deleteDigit = useCallback(() => {
+    if (flow === 'register_confirm' || flow === 'forgot_confirm') {
+      setConfirmPin(p => p.slice(0, -1));
+    } else {
+      setPin(p => p.slice(0, -1));
+    }
+  }, [flow]);
+
+  // ── Bio login — identical to previous implementation ────────────────────
   const handleBioLogin = async () => {
     setBioLoading(true); setErr('');
     try {
@@ -2003,186 +2034,275 @@ function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
         if (result.error === 'lockout' || result.error === 'lockout_permanent') {
           setErr('Face ID locked. Enter your device passcode first to re-enable it.');
         } else if (result.error === 'missing_usage_description') {
-          // NSFaceIDUsageDescription absent — Expo Go or non-native build.
-          // Auto-clear so the button disappears and user isn't confused.
           await clearBio();
           setBioSupported(false); setBioReady(false);
-          setErr('Face ID requires a native build. Use password login for now.');
+          setErr('Face ID requires a native build. Use PIN login for now.');
         } else {
-          setErr(`Face ID failed (${result.error || 'error'}). Use password instead.`);
+          setErr(`Face ID failed (${result.error || 'error'}). Use PIN instead.`);
         }
         return;
       }
       const storedRefresh = await loadBioRefresh();
       if (!storedRefresh) {
-        setErr('Face ID session expired. Log in with password to re-enable Face ID.');
+        setErr('Face ID session expired. Log in with PIN to re-enable Face ID.');
         await clearBio(); setBioReady(false);
         return;
       }
       const data = await api('/auth/bio-refresh', 'POST', { refresh: storedRefresh });
-      // Rotate: store the new refresh token returned by the server
       if (data.refresh) await saveBioRefresh(data.refresh);
       await saveToken(data.token); await saveUser(data.user);
       onAuth(data.token, data.user);
     } catch (e) {
-      // Refresh token expired or revoked — clear bio so user re-enables with password
       await clearBio(); setBioReady(false);
-      setErr('Face ID session expired. Please log in with your password and re-enable Face ID in Profile.');
-    }
-    finally { setBioLoading(false); }
+      setErr('Face ID session expired. Log in with PIN and re-enable Face ID in Profile.');
+    } finally { setBioLoading(false); }
   };
 
-  const handleLogin = async () => {
-    if (!username.trim() || !password.trim()) { setErr('Email and password are required.'); return; }
+  // ── PIN login ────────────────────────────────────────────────────────────
+  const handleLogin = useCallback(async () => {
+    if (pin.length < 6 || loading) return;
     setLoading(true); setErr('');
     try {
-      const data = await api('/auth/login', 'POST', { email: username.trim(), password });
-      await saveToken(data.token); await saveUser(data.user);
-      // Store refresh token so Face ID can use it without ever re-storing the password
-      if (data.refresh) await saveBioRefresh(data.refresh);
-      onAuth(data.token, data.user);
-    } catch (e) { setErr(e.message); }
-    finally { setLoading(false); }
-  };
-
-  const handleRegister = async () => {
-    if (!username.trim() || !email.trim() || !password.trim()) { setErr('Username, email and password are required.'); return; }
-    setLoading(true); setErr('');
-    try {
-      const body = { username: username.trim(), email: email.trim(), password };
-      if (inviteToken) body.invite_token = inviteToken; // auto-connects inviter as contact
-      const data = await api('/auth/register', 'POST', body);
+      const data = await api('/auth/pin-login', 'POST', { device_id: deviceId, pin });
       await saveToken(data.token); await saveUser(data.user);
       if (data.refresh) await saveBioRefresh(data.refresh);
       onAuth(data.token, data.user);
     } catch (e) { setErr(e.message); }
-    finally { setLoading(false); }
-  };
+    finally { setLoading(false); setPin(''); }
+  }, [pin, deviceId, loading, onAuth]);
 
-  const handlePasswordReset = async () => {
-    if (!resetEmail.trim()) { setResetMsg('Enter your email address.'); return; }
-    setResetLoading(true); setResetMsg('');
+  // ── PIN registration ─────────────────────────────────────────────────────
+  const handleRegister = useCallback(async () => {
+    if (loading) return;
+    setLoading(true); setErr('');
     try {
-      await api('/auth/password-reset', 'POST', { email: resetEmail.trim() });
-      setResetMsg('CHECK YOUR EMAIL — a reset link has been sent.');
+      const data = await api('/auth/register', 'POST', {
+        username: username.trim(), device_id: deviceId, pin,
+      });
+      await saveToken(data.token); await saveUser(data.user);
+      if (data.refresh) await saveBioRefresh(data.refresh);
+      onAuth(data.token, data.user);
     } catch (e) {
-      setResetMsg(e.message || 'Could not send reset link. Check the email and try again.');
-    } finally { setResetLoading(false); }
+      setErr(e.message); setFlow('register_pin'); setPin(''); setConfirmPin('');
+    } finally { setLoading(false); }
+  }, [username, deviceId, pin, loading, onAuth]);
+
+  // ── PIN reset (forgot PIN — re-register same device) ────────────────────
+  const handlePinReset = useCallback(async () => {
+    if (loading) return;
+    setLoading(true); setErr('');
+    try {
+      const data = await api('/auth/pin-reset', 'POST', {
+        device_id: deviceId, username: username.trim(), new_pin: pin,
+      });
+      await saveToken(data.token); await saveUser(data.user);
+      if (data.refresh) await saveBioRefresh(data.refresh);
+      onAuth(data.token, data.user);
+    } catch (e) {
+      setErr(e.message); setFlow('forgot_pin'); setPin(''); setConfirmPin('');
+    } finally { setLoading(false); }
+  }, [deviceId, username, pin, loading, onAuth]);
+
+  // ── Unified primary action handler ───────────────────────────────────────
+  const handlePrimaryAction = useCallback(() => {
+    setErr('');
+    switch (flow) {
+      case 'login':           handleLogin(); break;
+      case 'register_name':
+        if (!username.trim() || username.trim().length < 3) { setErr('Username must be 3-24 chars.'); return; }
+        setPin(''); setFlow('register_pin');
+        break;
+      case 'register_pin':
+        if (pin.length < 6) { setErr('Enter a 6-digit PIN.'); return; }
+        setConfirmPin(''); setFlow('register_confirm');
+        break;
+      case 'register_confirm':
+        if (confirmPin.length < 6) { setErr('Enter 6 digits to confirm.'); return; }
+        if (confirmPin !== pin) { setErr('PINs do not match. Try again.'); setConfirmPin(''); return; }
+        handleRegister();
+        break;
+      case 'forgot_name':
+        if (!username.trim() || username.trim().length < 3) { setErr('Enter your username.'); return; }
+        setPin(''); setFlow('forgot_pin');
+        break;
+      case 'forgot_pin':
+        if (pin.length < 6) { setErr('Enter a new 6-digit PIN.'); return; }
+        setConfirmPin(''); setFlow('forgot_confirm');
+        break;
+      case 'forgot_confirm':
+        if (confirmPin.length < 6) { setErr('Enter 6 digits to confirm.'); return; }
+        if (confirmPin !== pin) { setErr('PINs do not match. Try again.'); setConfirmPin(''); return; }
+        handlePinReset();
+        break;
+    }
+  }, [flow, username, pin, confirmPin, handleLogin, handleRegister, handlePinReset]);
+
+  const activePin = (flow === 'register_confirm' || flow === 'forgot_confirm') ? confirmPin : pin;
+  const showKeypad = flow !== 'register_name' && flow !== 'forgot_name';
+  const TITLES = {
+    login: 'ENTER PIN', register_name: 'CREATE ACCOUNT',
+    register_pin: 'SET YOUR PIN', register_confirm: 'CONFIRM PIN',
+    forgot_name: 'FORGOT PIN', forgot_pin: 'NEW PIN', forgot_confirm: 'CONFIRM NEW PIN',
   };
+  const PRIMARY_LABELS = {
+    login: 'UNLOCK', register_name: 'NEXT', register_pin: 'NEXT',
+    register_confirm: 'CREATE ACCOUNT', forgot_name: 'NEXT',
+    forgot_pin: 'NEXT', forgot_confirm: 'RESET PIN',
+  };
+  const pinReady = activePin.length === 6;
 
   return (
     <ThemedSafeArea>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
-      <KeyboardAvoidingView style={styles.flex} behavior={KAV_BEHAVIOR}>
-        <ScrollView contentContainerStyle={styles.authScroll} keyboardShouldPersistTaps="handled">
-          <View style={styles.logoBlock}>
-            <Animated.Image
-              source={require('./assets/icon.png')}
-              style={{ width: 96, height: 96, borderRadius: 22, marginBottom: 10, transform: [{ scale: logoScale }] }}
-              resizeMode="contain"
-            />
-            <Text style={[styles.logoText, { fontSize: 18, letterSpacing: 3 }]}>nano-SYNAPSYS</Text>
-            <Text style={styles.logoSub}>BY AI EVOLUTION</Text>
-          </View>
+      <ScrollView contentContainerStyle={styles.authScroll} keyboardShouldPersistTaps="handled">
+        {/* Logo */}
+        <View style={styles.logoBlock}>
+          <Image
+            source={require('./assets/icon.png')}
+            style={{ width: 96, height: 96, borderRadius: 22, marginBottom: 10 }}
+            resizeMode="contain"
+          />
+          <Text style={[styles.logoText, { fontSize: 18, letterSpacing: 3 }]}>nano-SYNAPSYS</Text>
+          <Text style={styles.logoSub}>BY AI EVOLUTION</Text>
+        </View>
 
-          {/* Invite banner — shown when user arrives via nanosynapsys://join/TOKEN */}
-          {inviteToken && inviterName && (
-            <View style={{
-              backgroundColor: '#00FF4115', borderWidth: 1, borderColor: '#00FF4140',
-              borderRadius: 6, padding: 12, marginBottom: 16, marginHorizontal: 4,
-              alignItems: 'center',
-            }}>
-              <Text style={{ fontFamily: mono, fontSize: 11, color: '#00FF41', fontWeight: '700', letterSpacing: 1.5 }}>
-                {'\u2713'} INVITED BY {inviterName.toUpperCase()}
-              </Text>
-              <Text style={{ fontFamily: mono, fontSize: 10, color: '#00c832', marginTop: 4, letterSpacing: 0.5 }}>
-                Register below — you'll be connected instantly
-              </Text>
-            </View>
-          )}
-
-          <View style={styles.authTabRow}>
-            {['LOGIN', 'REGISTER'].map((t) => (
-              <TouchableOpacity key={t} style={[styles.authTab, tab === t && styles.authTabActive]} onPress={() => handleTabSwitch(t)}>
-                <Text style={[styles.authTabText, tab === t && styles.authTabTextActive]}>{t}</Text>
-              </TouchableOpacity>
-            ))}
+        {/* Invite banner */}
+        {inviteToken && inviterName && (
+          <View style={{
+            backgroundColor: '#00FF4115', borderWidth: 1, borderColor: '#00FF4140',
+            borderRadius: 6, padding: 12, marginBottom: 16, marginHorizontal: 4, alignItems: 'center',
+          }}>
+            <Text style={{ fontFamily: mono, fontSize: 11, color: '#00FF41', fontWeight: '700', letterSpacing: 1.5 }}>
+              {'\u2713'} INVITED BY {inviterName.toUpperCase()}
+            </Text>
+            <Text style={{ fontFamily: mono, fontSize: 10, color: '#00c832', marginTop: 4, letterSpacing: 0.5 }}>
+              Register below — you'll be connected instantly
+            </Text>
           </View>
+        )}
+
+        {/* Section title */}
+        <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, letterSpacing: 2, textAlign: 'center', marginBottom: 14 }}>
+          {TITLES[flow]}
+        </Text>
+
+        {/* Username input — register_name / forgot_name flows */}
+        {!showKeypad && (
           <View style={styles.authForm}>
             <TextInput
               style={styles.input}
-              placeholder={tab === 'LOGIN' ? 'EMAIL' : 'USERNAME'}
+              placeholder="USERNAME"
               placeholderTextColor={C.muted}
-              value={username} onChangeText={setUsername}
-              autoCapitalize="none" autoCorrect={false}
-              keyboardType={tab === 'LOGIN' ? 'email-address' : 'default'}
-              onFocus={() => animateLogo(true)} onBlur={() => animateLogo(false)}
+              value={username}
+              onChangeText={t => { setUsername(t); setErr(''); }}
+              autoCapitalize="none"
+              autoCorrect={false}
+              maxLength={24}
             />
-            {tab === 'REGISTER' && (
-              <TextInput style={styles.input} placeholder="EMAIL" placeholderTextColor={C.muted}
-                value={email} onChangeText={setEmail} autoCapitalize="none" keyboardType="email-address" autoCorrect={false}
-                onFocus={() => animateLogo(true)} onBlur={() => animateLogo(false)} />
-            )}
-            <TextInput style={styles.input} placeholder="PASSWORD" placeholderTextColor={C.muted}
-              value={password} onChangeText={setPassword} secureTextEntry
-              onFocus={() => animateLogo(true)} onBlur={() => animateLogo(false)} />
             <ErrText msg={err} />
-            <TouchableOpacity style={[styles.primaryBtn, loading && styles.primaryBtnDisabled]}
-              onPress={tab === 'LOGIN' ? handleLogin : handleRegister} disabled={loading}>
-              {loading ? <Spinner /> : <Text style={styles.primaryBtnText}>{tab === 'LOGIN' ? 'LOGIN' : 'CREATE ACCOUNT'}</Text>}
+            <TouchableOpacity
+              style={[styles.primaryBtn, loading && styles.primaryBtnDisabled]}
+              onPress={handlePrimaryAction}
+              disabled={loading}
+            >
+              {loading ? <Spinner /> : <Text style={styles.primaryBtnText}>{PRIMARY_LABELS[flow]}</Text>}
             </TouchableOpacity>
-            {tab === 'LOGIN' && bioSupported && (
-              <TouchableOpacity style={[styles.bioLoginBtn, bioLoading && styles.primaryBtnDisabled]}
-                onPress={bioReady ? handleBioLogin : () => Alert.alert('FACE ID NOT SET UP', 'Go to Profile tab and tap "ENABLE FACE ID LOGIN" to set up biometric login.')}
-                disabled={bioLoading}>
-                {bioLoading ? <Spinner /> : (
-                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                    <IconLock size={15} color={C.accent} />
-                    <Text style={styles.bioLoginBtnText}>VAULT LOGIN</Text>
-                  </View>
-                )}
-              </TouchableOpacity>
-            )}
-            {tab === 'LOGIN' && !showReset && (
-              <TouchableOpacity onPress={() => { setShowReset(true); setResetMsg(''); setResetEmail(''); }} style={{ alignItems: 'center', marginTop: 16 }}>
-                <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, letterSpacing: 1 }}>FORGOT PASSWORD?</Text>
-              </TouchableOpacity>
-            )}
-            {tab === 'LOGIN' && showReset && (
-              <View style={{ marginTop: 20, borderTopWidth: 1, borderTopColor: C.border, paddingTop: 16 }}>
-                <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, letterSpacing: 1, marginBottom: 10 }}>
-                  RESET PASSWORD
-                </Text>
-                <TextInput
-                  style={styles.input}
-                  placeholder="YOUR EMAIL ADDRESS"
-                  placeholderTextColor={C.muted}
-                  value={resetEmail}
-                  onChangeText={setResetEmail}
-                  autoCapitalize="none"
-                  keyboardType="email-address"
-                  autoCorrect={false}
-                />
-                {!!resetMsg && (
-                  <Text style={{ fontFamily: mono, fontSize: 10, color: resetMsg.startsWith('CHECK') ? C.accent : C.red, textAlign: 'center', marginBottom: 8, lineHeight: 16 }}>
-                    {resetMsg}
-                  </Text>
-                )}
-                <TouchableOpacity
-                  style={[styles.primaryBtn, resetLoading && styles.primaryBtnDisabled]}
-                  onPress={handlePasswordReset}
-                  disabled={resetLoading}
-                >
-                  {resetLoading ? <Spinner /> : <Text style={styles.primaryBtnText}>SEND RESET LINK</Text>}
-                </TouchableOpacity>
-                <TouchableOpacity onPress={() => { setShowReset(false); setResetMsg(''); }} style={{ alignItems: 'center', marginTop: 12 }}>
-                  <Text style={{ fontFamily: mono, fontSize: 10, color: C.dim, letterSpacing: 1 }}>CANCEL</Text>
-                </TouchableOpacity>
+          </View>
+        )}
+
+        {/* PIN dots + numpad — all other flows */}
+        {showKeypad && (
+          <View style={{ alignItems: 'center' }}>
+            {/* 6 indicator dots */}
+            <View style={{ flexDirection: 'row', gap: 14, justifyContent: 'center', marginVertical: 20 }}>
+              {[0, 1, 2, 3, 4, 5].map(i => (
+                <View key={i} style={{
+                  width: 15, height: 15, borderRadius: 8,
+                  backgroundColor: i < activePin.length ? C.accent : 'transparent',
+                  borderWidth: 1.5,
+                  borderColor: i < activePin.length ? C.accent : C.border,
+                }} />
+              ))}
+            </View>
+            <ErrText msg={err} />
+
+            {/* Number pad */}
+            {[[1, 2, 3], [4, 5, 6], [7, 8, 9], ['', 0, '⌫']].map((row, ri) => (
+              <View key={ri} style={{ flexDirection: 'row', gap: 14, marginBottom: 12 }}>
+                {row.map((d, di) => (
+                  <TouchableOpacity
+                    key={di}
+                    style={{
+                      width: 72, height: 72, borderRadius: 36,
+                      borderWidth: d === '' ? 0 : 1,
+                      borderColor: C.border,
+                      alignItems: 'center', justifyContent: 'center',
+                    }}
+                    onPress={() => { if (d === '⌫') deleteDigit(); else if (d !== '') appendDigit(String(d)); }}
+                    disabled={d === ''}
+                    activeOpacity={0.6}
+                  >
+                    {d !== '' && (
+                      <Text style={{ fontFamily: mono, fontSize: d === '⌫' ? 20 : 24, color: C.text, fontWeight: '300' }}>
+                        {d}
+                      </Text>
+                    )}
+                  </TouchableOpacity>
+                ))}
+              </View>
+            ))}
+
+            {/* Action button — active only when 6 digits entered */}
+            <TouchableOpacity
+              style={[styles.primaryBtn, { marginTop: 8, width: 230 }, (!pinReady || loading) && styles.primaryBtnDisabled]}
+              onPress={handlePrimaryAction}
+              disabled={!pinReady || loading}
+            >
+              {loading ? <Spinner /> : <Text style={styles.primaryBtnText}>{PRIMARY_LABELS[flow]}</Text>}
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {/* Face ID button — login flow only */}
+        {flow === 'login' && bioSupported && (
+          <TouchableOpacity
+            style={[styles.bioLoginBtn, { marginTop: 16 }, bioLoading && styles.primaryBtnDisabled]}
+            onPress={bioReady
+              ? handleBioLogin
+              : () => Alert.alert('FACE ID NOT SET UP', 'Go to Profile tab and tap "ENABLE FACE ID LOGIN".')}
+            disabled={bioLoading}
+          >
+            {bioLoading ? <Spinner /> : (
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                <IconLock size={15} color={C.accent} />
+                <Text style={styles.bioLoginBtnText}>FACE ID LOGIN</Text>
               </View>
             )}
+          </TouchableOpacity>
+        )}
+
+        {/* Register / forgot PIN links — login flow only */}
+        {flow === 'login' && (
+          <View style={{ alignItems: 'center', marginTop: 20, gap: 14 }}>
+            <TouchableOpacity onPress={() => { setFlow('register_name'); setPin(''); setErr(''); setUsername(''); }}>
+              <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, letterSpacing: 1 }}>NEW DEVICE? REGISTER</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => { setFlow('forgot_name'); setPin(''); setErr(''); setUsername(''); }}>
+              <Text style={{ fontFamily: mono, fontSize: 10, color: C.dim, letterSpacing: 1 }}>FORGOT PIN?</Text>
+            </TouchableOpacity>
           </View>
-        </ScrollView>
-      </KeyboardAvoidingView>
+        )}
+
+        {/* Back link — all non-login flows */}
+        {flow !== 'login' && (
+          <TouchableOpacity
+            onPress={() => { setFlow('login'); setPin(''); setConfirmPin(''); setErr(''); setUsername(''); }}
+            style={{ alignItems: 'center', marginTop: 20 }}
+          >
+            <Text style={{ fontFamily: mono, fontSize: 10, color: C.dim, letterSpacing: 1 }}>BACK TO LOGIN</Text>
+          </TouchableOpacity>
+        )}
+      </ScrollView>
     </ThemedSafeArea>
   );
 }
@@ -4624,7 +4744,8 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
 // ---------------------------------------------------------------------------
 // SETTINGS TAB
 // ---------------------------------------------------------------------------
-function SettingsTab({ token, currentUser, notifEnabled, onSetNotifEnabled }) {
+function SettingsTab({ token, currentUser, notifEnabled, onSetNotifEnabled,
+                        bannerEnabled, onSetBannerEnabled, skipAuth, onSetSkipAuth }) {
   const { styles, C, skin, setSkin } = useSkin();
   const mono = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
   const [disappear, setDisappearState] = useState(null);
@@ -4668,6 +4789,43 @@ function SettingsTab({ token, currentUser, notifEnabled, onSetNotifEnabled }) {
 
   return (
     <ScrollView style={styles.flex} contentContainerStyle={styles.profileScroll}>
+
+      {/* ── ACCESS ────────────────────────────────────────────── */}
+      <Text style={styles.settingsHeader}>ACCESS</Text>
+
+      {/* Always Open (24h skip-auth) */}
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+        <View style={{ flex: 1, marginRight: 16 }}>
+          <Text style={{ fontFamily: mono, fontSize: 11, color: C.text, letterSpacing: 1 }}>ALWAYS OPEN (24H)</Text>
+          <Text style={{ fontFamily: mono, fontSize: 9, color: C.dim, marginTop: 2, letterSpacing: 0.5 }}>
+            Skip PIN and Face ID — resets automatically after 24 hours
+          </Text>
+        </View>
+        <Switch
+          value={!!skipAuth}
+          onValueChange={onSetSkipAuth}
+          thumbColor={skipAuth ? C.accent : C.dim}
+          trackColor={{ false: C.border, true: `${C.accent}55` }}
+        />
+      </View>
+
+      {/* Enable Banner AI */}
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+        <View style={{ flex: 1, marginRight: 16 }}>
+          <Text style={{ fontFamily: mono, fontSize: 11, color: C.text, letterSpacing: 1 }}>ENABLE BANNER AI</Text>
+          <Text style={{ fontFamily: mono, fontSize: 9, color: C.dim, marginTop: 2, letterSpacing: 0.5 }}>
+            Show Banner AI assistant tab
+          </Text>
+        </View>
+        <Switch
+          value={!!bannerEnabled}
+          onValueChange={onSetBannerEnabled}
+          thumbColor={bannerEnabled ? C.accent : C.dim}
+          trackColor={{ false: C.border, true: `${C.accent}55` }}
+        />
+      </View>
+
+      <View style={styles.profileDivider} />
 
       {/* ── SKIN ──────────────────────────────────────────────── */}
       <Text style={styles.settingsHeader}>INTERFACE SKIN</Text>
@@ -4782,7 +4940,7 @@ function SettingsTab({ token, currentUser, notifEnabled, onSetNotifEnabled }) {
       <Text style={styles.settingsHeader}>APP INFO</Text>
       <View style={styles.profileCard}>
         <Text style={styles.profileLabel}>VERSION</Text>
-        <Text style={styles.profileValue}>1.1.0</Text>
+        <Text style={styles.profileValue}>1.3.0</Text>
       </View>
       <View style={styles.profileCard}>
         <Text style={styles.profileLabel}>NETWORK</Text>
@@ -4806,7 +4964,9 @@ function HomeScreen({ token, currentUser, onLogout }) {
   const [groupChat, setGroupChat]     = useState(null);
   const [incomingMsg, setIncomingMsg] = useState(null);
   const [disappear, setDisappear]     = useState(null);
-  const [notifEnabled, setNotifEnabled] = useState(true);
+  const [notifEnabled,   setNotifEnabled]   = useState(true);
+  const [bannerEnabled,  setBannerEnabled]  = useState(true);
+  const [skipAuth,       setSkipAuth]       = useState(false);
   const [unreadCounts, setUnreadCounts] = useState({});
   const [showSearch,     setShowSearch]     = useState(false);
   const [searchQuery,    setSearchQuery]    = useState('');
@@ -4823,6 +4983,10 @@ function HomeScreen({ token, currentUser, onLogout }) {
   useEffect(() => {
     loadDisappear().then(v => setDisappear(v));
     loadNotifEnabled().then(v => { setNotifEnabled(v); notifRef.current = v; });
+    loadBannerEnabled().then(v => setBannerEnabled(v));
+    SecureStore.getItemAsync(SKIP_AUTH_KEY).then(v => {
+      setSkipAuth(Date.now() < parseInt(v || '0', 10));
+    });
     // Initialise E2EE keypair (generate if new, upload public key)
     initE2EE(token);
     // Register Expo push token with backend
@@ -4848,6 +5012,19 @@ function HomeScreen({ token, currentUser, onLogout }) {
     setNotifEnabled(v);
     notifRef.current = v;
     saveNotifEnabled(v);
+  }, []);
+
+  const handleSetBannerEnabled = useCallback(async (v) => {
+    setBannerEnabled(v);
+    await saveBannerEnabled(v);
+    // If BOT tab is active and user disables Banner, switch away
+    if (!v && activeTabRef.current === 'BOT') setActiveTab('CHATS');
+  }, []);
+
+  const handleSetSkipAuth = useCallback(async (v) => {
+    setSkipAuth(v);
+    const val = v ? String(Date.now() + 24 * 60 * 60 * 1000) : '0';
+    await SecureStore.setItemAsync(SKIP_AUTH_KEY, val);
   }, []);
 
   // Debounced full-text search across local SQLCipher DB
@@ -4990,6 +5167,9 @@ function HomeScreen({ token, currentUser, onLogout }) {
     GROUPS: Object.entries(unreadCounts).filter(([k]) => k.startsWith('group_')).reduce((s, [, v]) => s + v, 0),
   };
 
+  // Dynamic tab list — hide BOT when Banner is disabled
+  const visibleTabs = TABS.filter(t => t !== 'BOT' || bannerEnabled);
+
   if (dmPeer) {
     return (
       <DMChatScreen
@@ -5075,9 +5255,9 @@ function HomeScreen({ token, currentUser, onLogout }) {
           {activeTab === 'GROUPS'   && <GroupsTab token={token} onOpenGroup={openGroup} unread={unreadCounts} />}
           {activeTab === 'BOT'      && <BotTab token={token} wsRef={wsRef} currentUser={currentUser} />}
           {activeTab === 'PROFILE'  && <ProfileTab token={token} currentUser={currentUser} onLogout={onLogout} />}
-          {activeTab === 'SETTINGS' && <SettingsTab token={token} currentUser={currentUser} notifEnabled={notifEnabled} onSetNotifEnabled={handleSetNotifEnabled} />}
+          {activeTab === 'SETTINGS' && <SettingsTab token={token} currentUser={currentUser} notifEnabled={notifEnabled} onSetNotifEnabled={handleSetNotifEnabled} bannerEnabled={bannerEnabled} onSetBannerEnabled={handleSetBannerEnabled} skipAuth={skipAuth} onSetSkipAuth={handleSetSkipAuth} />}
         </View>
-        <TabBar active={activeTab} onChange={setActiveTab} unread={tabUnread} />
+        <TabBar active={activeTab} onChange={setActiveTab} unread={tabUnread} tabs={visibleTabs} />
       </KeyboardAvoidingView>
     </ThemedSafeArea>
   );
@@ -5123,6 +5303,26 @@ function AppInner() {
       try {
         const storedToken = await loadToken();
         if (!storedToken) { setAppState('auth'); return; }
+
+        // 24h skip-auth: if within the window, refresh silently and go straight home
+        const skipUntil = parseInt(await SecureStore.getItemAsync(SKIP_AUTH_KEY) || '0', 10);
+        if (Date.now() < skipUntil) {
+          const refreshTok = await loadBioRefresh();
+          if (refreshTok) {
+            try {
+              const data = await api('/auth/bio-refresh', 'POST', { refresh: refreshTok });
+              if (data.refresh) await saveBioRefresh(data.refresh);
+              await saveToken(data.token); await saveUser(data.user);
+              setToken(data.token); setUser(data.user);
+              setAppState('home');
+              return;
+            } catch {
+              // Refresh failed — clear skip-auth and fall through to normal check
+              await SecureStore.deleteItemAsync(SKIP_AUTH_KEY).catch(() => {});
+            }
+          }
+        }
+
         const rawMe = await api('/auth/me', 'GET', null, storedToken);
         // MeView wraps in { user: {...} } — unwrap it
         const user = rawMe?.user ?? rawMe;
