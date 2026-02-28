@@ -1190,12 +1190,14 @@ async function api(path, method = 'GET', body = null, token = null, _isRetry = f
   try { data = await res.json(); } catch { data = {}; }
 
   // Auto-refresh on 401 (expired access token) — one retry only
-  if (res.status === 401 && !_isRetry && _SESSION_REFRESH) {
-    try {
+  if (res.status === 401 && !_isRetry) {
+    // Use module-level refresh token, or fall back to SecureStore
+    const refreshTok = _SESSION_REFRESH || await SecureStore.getItemAsync(BIO_REFRESH_KEY);
+    if (refreshTok) try {
       const rr = await fetch(`${BASE_URL}/auth/bio-refresh`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refresh: _SESSION_REFRESH }),
+        body: JSON.stringify({ refresh: refreshTok }),
       });
       if (rr.ok) {
         const rd = await rr.json();
@@ -2541,7 +2543,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
     }
   };
 
-  // Auto-detect which contacts are on the app (runs silently in background)
+  // Auto-detect which contacts are on the app and auto-add them
   const autoSearchContacts = async (contacts) => {
     setAutoSearching(true);
     const todo = contacts.slice(0, 50); // cap at 50 to stay responsive
@@ -2558,7 +2560,28 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
       } catch { return null; }
     }));
     const map = {};
-    results.forEach(r => { if (r.status === 'fulfilled' && r.value) map[r.value.phone] = r.value.user; });
+    const newIds = new Set();
+    for (const r of results) {
+      if (r.status !== 'fulfilled' || !r.value) continue;
+      const { phone, user } = r.value;
+      map[phone] = user;
+      // Auto-add as contact + set green LED if not already a contact
+      if (!appContactIds.has(user.id)) {
+        try {
+          await api('/api/contacts/request', 'POST', { userId: user.id }, token);
+          newIds.add(user.id);
+          await _pcSave(phone, { s: 'c' });
+        } catch {}
+      } else {
+        // Already a contact — ensure green LED
+        await _pcSave(phone, { s: 'c' });
+      }
+    }
+    if (newIds.size > 0) {
+      setAppContactIds(prev => new Set([...prev, ...newIds]));
+    }
+    // Reload phone statuses to reflect all changes
+    setPhoneStatuses(await _pcLoad());
     setAutoMatchedMap(map);
     setAutoSearching(false);
   };
@@ -5029,7 +5052,9 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
                   .filter(c => !contactsQuery.trim() || c.name.toLowerCase().includes(contactsQuery.toLowerCase()) || c.phone.includes(contactsQuery))
                   .map(c => {
                     const ps = getPhoneStatus(c.phone);  // 'c' | 'i' | null
-                    const ledColor = ps === 'c' ? C.accent : ps === 'i' ? C.amber : C.red;
+                    const matched = autoMatchedMap[c.phone];
+                    const onApp = !!matched;
+                    const ledColor = ps === 'c' ? C.accent : ps === 'i' ? C.amber : onApp ? C.accent : C.red;
                     return (
                       <View key={c.id} style={[styles.contactRow, { paddingVertical: 10 }]}>
                         {/* LED dot */}
@@ -5040,7 +5065,7 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
                           <Text style={styles.contactRowMeta}>{c.phone}</Text>
                         </View>
                         {/* Action area */}
-                        {ps === 'c' ? (
+                        {ps === 'c' || onApp ? (
                           <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 10, color: C.accent, letterSpacing: 0.5 }}>✓ CONTACT</Text>
                         ) : ps === 'i' ? (
                           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
