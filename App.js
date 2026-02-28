@@ -1427,8 +1427,9 @@ function OnlineDot({ online }) {
   return <View style={[{ width: 8, height: 8, borderRadius: 4, marginLeft: 4 }, { backgroundColor: online ? C.green : C.muted }]} />;
 }
 
-function AppHeader({ title, onBack, rightComponent }) {
-  const { styles } = useSkin();
+function AppHeader({ title, subtitle, avatarUri, onBack, rightComponent }) {
+  const { styles, C } = useSkin();
+  const mono = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
   const slideIn = useRef(new Animated.Value(-20)).current;
   const fadeIn  = useRef(new Animated.Value(0)).current;
   useEffect(() => {
@@ -1446,7 +1447,15 @@ function AppHeader({ title, onBack, rightComponent }) {
       ) : (
         <View style={{ width: 42 }} />
       )}
-      <Text style={styles.appHeaderTitle}>{title}</Text>
+      <View style={{ flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+        {avatarUri ? (
+          <Image source={{ uri: avatarUri }} style={{ width: 30, height: 30, borderRadius: 15, borderWidth: 1, borderColor: C.accentMid }} />
+        ) : null}
+        <View style={{ alignItems: avatarUri ? 'flex-start' : 'center' }}>
+          <Text style={styles.appHeaderTitle} numberOfLines={1}>{title}</Text>
+          {subtitle ? <Text style={{ fontFamily: mono, fontSize: 9, color: C.dim, letterSpacing: 0.5 }}>{subtitle}</Text> : null}
+        </View>
+      </View>
       {rightComponent ? rightComponent : <View style={{ width: 42 }} />}
     </Animated.View>
   );
@@ -2969,20 +2978,34 @@ function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
                 }} />
               )}
 
-              {/* Avatar circle */}
-              <View style={{
-                width: 56, height: 56, borderRadius: 28,
-                backgroundColor: avatarBg,
-                alignItems: 'center', justifyContent: 'center',
-                marginBottom: 8,
-                borderWidth: 2,
-                borderColor: item.online ? C.accent : 'transparent',
-              }}>
-                <Text style={{ color: '#fff', fontSize: 24, fontWeight: '700', fontFamily: mono }}>{initials}</Text>
-              </View>
+              {/* Avatar */}
+              {item.avatar_url ? (
+                <Image source={{ uri: item.avatar_url }} style={{
+                  width: 56, height: 56, borderRadius: 28,
+                  marginBottom: 8,
+                  borderWidth: 2,
+                  borderColor: item.online ? C.accent : C.accentMid,
+                }} />
+              ) : (
+                <View style={{
+                  width: 56, height: 56, borderRadius: 28,
+                  backgroundColor: avatarBg,
+                  alignItems: 'center', justifyContent: 'center',
+                  marginBottom: 8,
+                  borderWidth: 2,
+                  borderColor: item.online ? C.accent : 'transparent',
+                }}>
+                  <Text style={{ color: '#fff', fontSize: 24, fontWeight: '700', fontFamily: mono }}>{initials}</Text>
+                </View>
+              )}
 
-              {/* Name */}
+              {/* Display name */}
               <Text style={{ fontFamily: mono, fontSize: 12, fontWeight: '700', color: C.text, letterSpacing: 0.5, textAlign: 'center' }} numberOfLines={1}>{name}</Text>
+
+              {/* Username subtitle */}
+              {name !== item.username && item.username && (
+                <Text style={{ fontFamily: mono, fontSize: 9, color: C.dim, letterSpacing: 0.5, marginTop: 1, textAlign: 'center' }} numberOfLines={1}>@{item.username}</Text>
+              )}
 
               {/* Status */}
               <Text style={{ fontFamily: mono, fontSize: 9, color: item.online ? C.accent : C.dim, letterSpacing: 0.5, marginTop: 3, textAlign: 'center' }} numberOfLines={1}>{statusText}</Text>
@@ -3243,7 +3266,12 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
   return (
     <ThemedSafeArea>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
-      <AppHeader title={peer.display_name || peer.displayName || peer.username} onBack={onBack} />
+      <AppHeader
+        title={peer.display_name || peer.displayName || peer.username}
+        subtitle={peer.display_name || peer.displayName ? `@${peer.username}` : undefined}
+        avatarUri={peer.avatar_url}
+        onBack={onBack}
+      />
       {disappear && (
         <View style={{ backgroundColor: C.panel, paddingHorizontal: 14, paddingVertical: 4, alignItems: 'center' }}>
           <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 10, color: C.amber, letterSpacing: 1 }}>
@@ -4200,13 +4228,10 @@ function TypingDots() {
 // ---------------------------------------------------------------------------
 // PROFILE TAB
 // ---------------------------------------------------------------------------
-function ProfileTab({ token, currentUser, onLogout }) {
+function ProfileTab({ token, currentUser, onLogout, profileImageUri, setProfileImageUri }) {
   const { styles, C } = useSkin();
   const mono = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
   const BASE_URL_LOCAL = 'https://nano-synapsys-server.fly.dev';
-
-  // ── avatar state ───────────────────────────────────────────────────────
-  const [profileImageUri, setProfileImageUri] = useState(null);
 
   // ── invite / bio state ────────────────────────────────────────────────
   const [loading, setLoading]     = useState(false);
@@ -4236,7 +4261,7 @@ function ProfileTab({ token, currentUser, onLogout }) {
 
   useEffect(() => {
     (async () => {
-      const [bioReady, bioOn, ext, pmMsgs, pmSend, pmCal, pmCon, savedUri] = await Promise.all([
+      const [bioReady, bioOn, ext, pmMsgs, pmSend, pmCal, pmCon] = await Promise.all([
         isBiometricReady(),
         loadBioEnabled(),
         loadProfileExt(),
@@ -4244,7 +4269,6 @@ function ProfileTab({ token, currentUser, onLogout }) {
         loadBannerPerm(BANNER_PERM_SEND_KEY),
         loadBannerPerm(BANNER_PERM_CAL_KEY),
         loadBannerPerm(BANNER_PERM_CON_KEY),
-        SecureStore.getItemAsync(PROFILE_IMAGE_KEY),
       ]);
       setBioAvailable(bioReady);
       setBioEnabled(bioOn);
@@ -4253,8 +4277,6 @@ function ProfileTab({ token, currentUser, onLogout }) {
       setResidentialAddr(ext.residentialAddr ?? '');
       setWorkAddr(ext.workAddr ?? '');
       setBpMsgs(pmMsgs); setBpSend(pmSend); setBpCal(pmCal); setBpCon(pmCon);
-      // Load saved profile image — trust SecureStore; Image onError handles stale URIs
-      if (savedUri) setProfileImageUri(savedUri);
     })();
   }, []);
 
@@ -4274,6 +4296,11 @@ function ProfileTab({ token, currentUser, onLogout }) {
         }
         setProfileImageUri(destUri);
         await SecureStore.setItemAsync(PROFILE_IMAGE_KEY, destUri);
+        // Sync avatar to backend so other users can see it
+        try {
+          const b64 = asset.base64 || await FileSystem.readAsStringAsync(destUri, { encoding: FileSystem.EncodingType.Base64 });
+          await api('/api/profile', 'PATCH', { avatar_base64: b64 }, token);
+        } catch {}
       } catch {
         // Last resort: use picker URI for this session (won't survive restart)
         setProfileImageUri(asset.uri);
@@ -5291,6 +5318,7 @@ function HomeScreen({ token, currentUser, onLogout }) {
   const [showSearch,     setShowSearch]     = useState(false);
   const [searchQuery,    setSearchQuery]    = useState('');
   const [searchResults,  setSearchResults]  = useState([]);
+  const [profileImageUri, setProfileImageUri] = useState(null);
 
   const wsRef          = useRef(null);
   const reconnectRef   = useRef(null);
@@ -5306,6 +5334,10 @@ function HomeScreen({ token, currentUser, onLogout }) {
     loadBannerEnabled().then(v => setBannerEnabled(v));
     SecureStore.getItemAsync(SKIP_AUTH_KEY).then(v => {
       setSkipAuth(Date.now() < parseInt(v || '0', 10));
+    });
+    // Load persisted profile image URI
+    SecureStore.getItemAsync(PROFILE_IMAGE_KEY).then(uri => {
+      if (uri) setProfileImageUri(uri);
     });
     // Initialise E2EE keypair (generate if new, upload public key)
     initE2EE(token);
@@ -5574,7 +5606,7 @@ function HomeScreen({ token, currentUser, onLogout }) {
           {activeTab === 'CHATS'    && <ChatsTab token={token} currentUser={currentUser} onOpenDM={openDM} unread={unreadCounts} />}
           {activeTab === 'GROUPS'   && <GroupsTab token={token} onOpenGroup={openGroup} unread={unreadCounts} />}
           {activeTab === 'BOT'      && <BotTab token={token} wsRef={wsRef} currentUser={currentUser} />}
-          {activeTab === 'PROFILE'  && <ProfileTab token={token} currentUser={currentUser} onLogout={onLogout} />}
+          {activeTab === 'PROFILE'  && <ProfileTab token={token} currentUser={currentUser} onLogout={onLogout} profileImageUri={profileImageUri} setProfileImageUri={setProfileImageUri} />}
           {activeTab === 'SETTINGS' && <SettingsTab token={token} currentUser={currentUser} notifEnabled={notifEnabled} onSetNotifEnabled={handleSetNotifEnabled} bannerEnabled={bannerEnabled} onSetBannerEnabled={handleSetBannerEnabled} skipAuth={skipAuth} onSetSkipAuth={handleSetSkipAuth} />}
         </View>
         <TabBar active={activeTab} onChange={setActiveTab} unread={tabUnread} tabs={visibleTabs} />
