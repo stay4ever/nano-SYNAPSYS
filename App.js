@@ -3851,15 +3851,34 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
           `SMS is not available on this device.\n\nThe invite link has been copied to your clipboard — paste it and share with ${contact.name}.`,
         );
       }
-      // Mark phone as pending invite (amber LED, 25-minute window)
+      // Mark phone as pending invite (amber LED, 25-minute window) — store token for server cancel
       if (sent) {
-        await _savePhoneStatus(contact.phone, { s: 'i', e: Date.now() + 25 * 60 * 1000 });
+        const storedToken = data.token || inviteToken || null;
+        await _savePhoneStatus(contact.phone, { s: 'i', e: Date.now() + 25 * 60 * 1000, t: storedToken });
       }
     } catch (e) {
       Alert.alert('ERROR', e.message || 'Failed to send invite. Please try again.');
     } finally {
       setInviting(null);
     }
+  };
+
+  const cancelInvite = async (contact) => {
+    const normalized = _nrmPhone(contact.phone);
+    const entry = phoneStatuses[normalized];
+    const storedToken = entry?.t || null;
+    try {
+      if (storedToken) {
+        await api(`/api/invites/cancel/${storedToken}`, 'DELETE', null, token);
+      } else {
+        await api('/api/invites', 'DELETE', null, token);
+      }
+    } catch {}
+    // Clear local status so the row resets to FIND / INVITE
+    const map = await _loadPhoneStatuses();
+    delete map[normalized];
+    try { await SecureStore.setItemAsync(_PHONE_KEY, JSON.stringify(map)); } catch {}
+    setPhoneStatuses(prev => { const n = { ...prev }; delete n[normalized]; return n; });
   };
 
   // Find a phone contact on the app — if not found, offer SMS invite automatically
@@ -4072,7 +4091,15 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
                         {ps === 'c' ? (
                           <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 10, color: C.accent, letterSpacing: 0.5 }}>✓ CONTACT</Text>
                         ) : ps === 'i' ? (
-                          <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 10, color: C.amber, letterSpacing: 0.5 }}>PENDING</Text>
+                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                            <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 9, color: C.amber, letterSpacing: 0.5 }}>PENDING</Text>
+                            <TouchableOpacity
+                              style={[styles.contactActionBtn, { borderColor: C.red, paddingHorizontal: 6 }]}
+                              onPress={() => cancelInvite(c)}
+                            >
+                              <Text style={[styles.contactActionBtnText, { color: C.red }]}>✕</Text>
+                            </TouchableOpacity>
+                          </View>
                         ) : (
                           <View style={{ flexDirection: 'row', gap: 6 }}>
                             <TouchableOpacity
