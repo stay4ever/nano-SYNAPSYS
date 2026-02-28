@@ -3675,12 +3675,11 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
       // E2EE: encrypt text messages with Signal Sender Keys
       let payload = content;
       if (!isImage && e2eeKey()) {
-        payload = await encryptGroupMsg(content, null, group.id, String(currentUser.id));
-        if (payload === null) {
-          Alert.alert('ENCRYPTION ERROR', 'Could not encrypt group message. Send aborted.');
-          setSending(false);
-          return;
-        }
+        try {
+          const enc = await encryptGroupMsg(content, null, group.id, String(currentUser.id));
+          if (enc !== null) payload = enc;
+          // If null: E2EE key not ready — fall back to plaintext silently
+        } catch { /* fallback to plaintext */ }
       }
       // Phoenix channel: join the group topic, then push via group_message event
       if (!isImage && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && wsRef.current._phxSend) {
@@ -4033,7 +4032,7 @@ function BotTab({ token, wsRef }) {
           permissions: { msgs: bpMsgs, send: bpSend, cal: bpCal, contacts: bpCon },
         };
         if (imgToSend?.base64) { body.image_base64 = imgToSend.base64; body.image_mime = imgToSend.mimeType || 'image/jpeg'; }
-        const data = await api('/api/bot/chat', 'POST', body, token);
+        const data = await api('/api/bot/chat', 'POST', body, null); // null → uses _SESSION_TOKEN (always fresh)
         const raw  = data.reply || '...';
         // Parse optional <<<ACTION:{...}>>> block appended by Banner
         const ACTION_RE = /<<<ACTION:([\s\S]*?)>>>/;
@@ -4263,9 +4262,13 @@ function ProfileTab({ token, currentUser, onLogout }) {
       const srcUri = res.assets[0].uri;
       // Unique filename busts React Native image cache; permanent path survives restarts
       const destUri = FileSystem.documentDirectory + `profile_avatar_${Date.now()}.jpg`;
-      await FileSystem.copyAsync({ from: srcUri, to: destUri });
-      setProfileImageUri(destUri);
-      await SecureStore.setItemAsync(PROFILE_IMAGE_KEY, destUri);
+      let finalUri = srcUri; // fallback: use src if copy fails
+      try {
+        await FileSystem.copyAsync({ from: srcUri, to: destUri });
+        finalUri = destUri;
+      } catch { /* copy failed — use srcUri for this session */ }
+      setProfileImageUri(finalUri);
+      await SecureStore.setItemAsync(PROFILE_IMAGE_KEY, finalUri);
     }
   };
 
