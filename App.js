@@ -1,3 +1,5 @@
+// Polyfill crypto.getRandomValues — MUST be first import (required by tweetnacl / @noble/hashes in RN)
+import 'react-native-get-random-values';
 /**
  * nano-SYNAPSYS
  * AI Evolution secure messaging + bot client
@@ -147,12 +149,19 @@ function makeRawStyles(C) {
       color: C.bright, letterSpacing: 1, textAlign: 'center',
     },
     backBtnCircle: {
-      width: 34, height: 34, borderRadius: 17,
-      backgroundColor: 'rgba(0,255,65,0.09)',
+      width: 46, height: 46, borderRadius: 23,
+      backgroundColor: 'rgba(255,255,255,0.13)',
       justifyContent: 'center', alignItems: 'center',
       marginLeft: 4,
     },
-    backBtnChevron: { fontFamily: mono, fontSize: 22, color: C.accent, lineHeight: 26, marginTop: -1 },
+    backBtnChevron: { fontFamily: mono, fontSize: 26, color: C.accent, lineHeight: 30, marginTop: -1 },
+
+    closeCircleBtn: {
+      width: 46, height: 46, borderRadius: 23,
+      backgroundColor: 'rgba(255,255,255,0.13)',
+      alignItems: 'center', justifyContent: 'center',
+    },
+    closeCircleText: { color: '#fff', fontSize: 20, fontWeight: '700' },
 
     homeHeader: {
       backgroundColor: C.surface,
@@ -664,6 +673,7 @@ const BANNER_PERM_CON_KEY  = 'banner_perm_con';
 const DEVICE_ID_KEY      = 'nano_device_id';        // UUID, never changes
 const SKIP_AUTH_KEY      = 'nano_skip_auth';         // Unix ms expiry timestamp
 const BANNER_ENABLED_KEY = 'nano_banner_enabled';    // '1' | '0'
+const PROFILE_IMAGE_KEY  = 'nano_profile_image';     // local URI of chosen avatar
 
 const DISAPPEAR_OPTIONS = [
   { label: 'OFF',     value: null   },
@@ -1316,30 +1326,8 @@ async function showLocalNotification(title, body) {
 // ---------------------------------------------------------------------------
 // THEMED WRAPPERS
 // ---------------------------------------------------------------------------
-/* SynapseTexture — custom dot-grid background, replaces magpul branding */
+/* SynapseTexture — dot-grid background */
 function SynapseTexture({ accentColor }) {
-  // 6 radial arms at 60° intervals for the central mark
-  const arms = [0, 60, 120, 180, 240, 300].map((deg) => {
-    const rad = (deg * Math.PI) / 180;
-    const cos = Math.cos(rad);
-    const sin = Math.sin(rad);
-    const tx = (80 * cos).toFixed(1);
-    const ty = (80 * sin).toFixed(1);
-    const bx = (52 * cos).toFixed(1);
-    const by = (52 * sin).toFixed(1);
-    const b1x = (52 * cos + 14 * Math.cos(rad + Math.PI / 3)).toFixed(1);
-    const b1y = (52 * sin + 14 * Math.sin(rad + Math.PI / 3)).toFixed(1);
-    const b2x = (52 * cos + 14 * Math.cos(rad - Math.PI / 3)).toFixed(1);
-    const b2y = (52 * sin + 14 * Math.sin(rad - Math.PI / 3)).toFixed(1);
-    return { tx, ty, bx, by, b1x, b1y, b2x, b2y };
-  });
-  const hexPts = [0, 60, 120, 180, 240, 300]
-    .map((d) => {
-      const r = (d * Math.PI) / 180;
-      return `${(88 * Math.cos(r)).toFixed(1)},${(88 * Math.sin(r)).toFixed(1)}`;
-    })
-    .join(' ');
-
   return (
     <Svg style={StyleSheet.absoluteFill} width="100%" height="100%" preserveAspectRatio="xMidYMid slice">
       <Defs>
@@ -1350,28 +1338,8 @@ function SynapseTexture({ accentColor }) {
           <Line x1="14" y1="0" x2="14" y2="28" stroke={accentColor} strokeOpacity="0.025" strokeWidth="0.5" />
         </Pattern>
       </Defs>
-
       {/* Full-screen dot grid */}
       <Rect width="100%" height="100%" fill="url(#sg)" />
-
-      {/* Central synapse mark — watermark at screen center */}
-      <G opacity="0.07" transform={`translate(${Dimensions.get('window').width / 2}, ${Dimensions.get('window').height / 2})`}>
-        {/* Outer connecting hexagon */}
-        <Polygon points={hexPts} stroke={accentColor} strokeWidth="1" fill="none" />
-        {/* Radial arms + branches */}
-        {arms.map((a, i) => (
-          <G key={i}>
-            <Line x1="0" y1="0" x2={a.tx} y2={a.ty} stroke={accentColor} strokeWidth="0.8" />
-            <Line x1={a.bx} y1={a.by} x2={a.b1x} y2={a.b1y} stroke={accentColor} strokeWidth="0.6" />
-            <Line x1={a.bx} y1={a.by} x2={a.b2x} y2={a.b2y} stroke={accentColor} strokeWidth="0.6" />
-            <Circle cx={parseFloat(a.tx)} cy={parseFloat(a.ty)} r="3.5" fill={accentColor} />
-          </G>
-        ))}
-        {/* Nucleus rings */}
-        <Circle cx="0" cy="0" r="18" stroke={accentColor} strokeWidth="1.2" fill="none" />
-        <Circle cx="0" cy="0" r="8" stroke={accentColor} strokeWidth="0.8" fill="none" />
-        <Circle cx="0" cy="0" r="3" fill={accentColor} />
-      </G>
     </Svg>
   );
 }
@@ -1651,8 +1619,8 @@ function GroupMembersModal({ token, group, currentUser, visible, onClose }) {
         <View style={[styles.modalBox, { maxHeight: '85%' }]}>
           <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
             <Text style={styles.modalTitle}>MEMBERS</Text>
-            <TouchableOpacity onPress={onClose}>
-              <Text style={{ fontFamily: mono, fontSize: 14, color: C.dim }}>{'\u2715'}</Text>
+            <TouchableOpacity onPress={onClose} style={styles.closeCircleBtn}>
+              <Text style={styles.closeCircleText}>{'\u2715'}</Text>
             </TouchableOpacity>
           </View>
 
@@ -2655,7 +2623,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
           {/* Header */}
           <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingBottom: 10 }}>
             <Text style={{ fontFamily: mono, fontSize: 13, color: C.accent, fontWeight: '700', letterSpacing: 1, flex: 1 }}>MY PHONE CONTACTS</Text>
-            <TouchableOpacity onPress={onClose}><Text style={{ fontFamily: mono, fontSize: 16, color: C.muted }}>✕</Text></TouchableOpacity>
+            <TouchableOpacity onPress={onClose} style={styles.closeCircleBtn}><Text style={styles.closeCircleText}>✕</Text></TouchableOpacity>
           </View>
           {/* Inline toast */}
           {toast ? (
@@ -2791,15 +2759,23 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
 }
 
 // ---------------------------------------------------------------------------
-// CHATS TAB
+// CHATS TAB — 2-column grid
 // ---------------------------------------------------------------------------
+const CHAT_CARD_GAP    = 6;
+const CHAT_CARD_MARGIN = 10;
+
 function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
   const { styles, C } = useSkin();
-  const [users,          setUsers]          = useState([]);
-  const [loading,        setLoading]        = useState(true);
-  const [refreshing,     setRefreshing]     = useState(false);
-  const [err,            setErr]            = useState('');
-  const [showContacts,   setShowContacts]   = useState(false);
+  const mono = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
+  const [users,        setUsers]        = useState([]);
+  const [loading,      setLoading]      = useState(true);
+  const [refreshing,   setRefreshing]   = useState(false);
+  const [err,          setErr]          = useState('');
+  const [showContacts, setShowContacts] = useState(false);
+  const screenW = Dimensions.get('window').width;
+  const cardW   = (screenW - CHAT_CARD_MARGIN * 2 - CHAT_CARD_GAP) / 2;
+
+  const AVATAR_COLORS = ['#1a472a','#14213d','#4a1942','#7b2d00','#003049','#1b4332','#312244','#3d1c02'];
 
   const fetchUsers = useCallback(async (isRefresh = false) => {
     if (isRefresh) setRefreshing(true); else setLoading(true);
@@ -2814,13 +2790,22 @@ function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
   useEffect(() => { fetchUsers(); }, [fetchUsers]);
 
   const deleteChat = useCallback(async (user) => {
-    setUsers(prev => prev.filter(u => u.id !== user.id));
-    try {
-      await api(`/api/messages/delete/${user.id}`, 'DELETE', null, token);
-    } catch (e) {
-      setErr(e.message);
-      fetchUsers();
-    }
+    Alert.alert(
+      'DELETE CHAT',
+      `Delete conversation with ${user.displayName || user.display_name || user.username}?`,
+      [
+        { text: 'CANCEL', style: 'cancel' },
+        {
+          text: 'DELETE', style: 'destructive',
+          onPress: async () => {
+            setUsers(prev => prev.filter(u => u.id !== user.id));
+            try {
+              await api(`/api/messages/delete/${user.id}`, 'DELETE', null, token);
+            } catch (e) { setErr(e.message); fetchUsers(); }
+          },
+        },
+      ],
+    );
   }, [token, fetchUsers]);
 
   if (loading) return <View style={styles.centerFill}><Spinner size="large" /></View>;
@@ -2829,34 +2814,79 @@ function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
     <View style={styles.flex}>
       <ErrText msg={err} />
       <FlatList
-        data={users} keyExtractor={(u) => String(u.id)}
+        data={users}
+        keyExtractor={(u) => String(u.id)}
+        numColumns={2}
+        columnWrapperStyle={{ gap: CHAT_CARD_GAP, paddingHorizontal: CHAT_CARD_MARGIN }}
+        contentContainerStyle={{ paddingTop: 10, paddingBottom: 100, gap: CHAT_CARD_GAP }}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchUsers(true)} tintColor={C.accent} />}
-        ListEmptyComponent={<Text style={styles.emptyText}>NO CHATS YET{'\n'}Tap + to add contacts</Text>}
+        ListEmptyComponent={<Text style={[styles.emptyText, { textAlign: 'center', marginTop: 40 }]}>NO CHATS YET{'\n'}Tap + to find contacts</Text>}
         renderItem={({ item }) => {
-          const cnt = unread[`dm_${item.id}`] || 0;
+          const cnt  = unread[`dm_${item.id}`] || 0;
+          const name = item.displayName || item.display_name || item.username || '?';
+          const initials = name[0].toUpperCase();
+          const avatarBg = AVATAR_COLORS[item.id % AVATAR_COLORS.length];
+          const statusText = item.online ? 'ONLINE' : item.last_seen ? `SEEN ${fmtDate(item.last_seen)}` : 'OFFLINE';
+
           return (
-            <SwipeableRow rightLabel="CLEAR" rightColor={C.red} onAction={() => deleteChat(item)}>
-              <TouchableOpacity style={styles.userRow} onPress={() => onOpenDM(item)}>
-                <View style={styles.userRowLeft}>
-                  <OnlineDot online={item.online} />
-                  <View style={styles.userRowInfo}>
-                    <Text style={styles.userRowName}>{item.displayName || item.display_name || item.username}</Text>
-                    <Text style={styles.userRowMeta}>{item.online ? 'ONLINE' : item.last_seen ? `LAST SEEN ${fmtDate(item.last_seen)}` : 'OFFLINE'}</Text>
-                  </View>
+            <TouchableOpacity
+              style={{
+                width: cardW,
+                backgroundColor: 'rgba(0,255,65,0.07)',
+                borderWidth: 1,
+                borderColor: 'rgba(0,255,65,0.15)',
+                borderRadius: 16,
+                padding: 12,
+                alignItems: 'center',
+                position: 'relative',
+              }}
+              onPress={() => onOpenDM(item)}
+              onLongPress={() => deleteChat(item)}
+              delayLongPress={500}
+              activeOpacity={0.75}
+            >
+              {/* Unread badge */}
+              {cnt > 0 && (
+                <View style={{
+                  position: 'absolute', top: -6, right: -6,
+                  backgroundColor: '#ee0011',
+                  width: 20, height: 20, borderRadius: 10,
+                  alignItems: 'center', justifyContent: 'center',
+                  zIndex: 10,
+                }}>
+                  <Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>{cnt > 99 ? '99+' : cnt}</Text>
                 </View>
-                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                  {cnt > 0 && (
-                    <View style={styles.rowBadge}>
-                      <Text style={styles.rowBadgeText}>{cnt > 99 ? '99+' : cnt}</Text>
-                    </View>
-                  )}
-                  <Text style={styles.chevron}>{'>'}</Text>
-                </View>
-              </TouchableOpacity>
-            </SwipeableRow>
+              )}
+
+              {/* Online indicator */}
+              {item.online && (
+                <View style={{
+                  position: 'absolute', top: 8, left: 10,
+                  width: 8, height: 8, borderRadius: 4,
+                  backgroundColor: C.accent,
+                }} />
+              )}
+
+              {/* Avatar circle */}
+              <View style={{
+                width: 56, height: 56, borderRadius: 28,
+                backgroundColor: avatarBg,
+                alignItems: 'center', justifyContent: 'center',
+                marginBottom: 8,
+                borderWidth: 2,
+                borderColor: item.online ? C.accent : 'transparent',
+              }}>
+                <Text style={{ color: '#fff', fontSize: 24, fontWeight: '700', fontFamily: mono }}>{initials}</Text>
+              </View>
+
+              {/* Name */}
+              <Text style={{ fontFamily: mono, fontSize: 12, fontWeight: '700', color: C.text, letterSpacing: 0.5, textAlign: 'center' }} numberOfLines={1}>{name}</Text>
+
+              {/* Status */}
+              <Text style={{ fontFamily: mono, fontSize: 9, color: item.online ? C.accent : C.dim, letterSpacing: 0.5, marginTop: 3, textAlign: 'center' }} numberOfLines={1}>{statusText}</Text>
+            </TouchableOpacity>
           );
         }}
-        ItemSeparatorComponent={() => <View style={styles.separator} />}
       />
 
       {/* Floating + button */}
@@ -3102,8 +3132,15 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
   };
   const getMediaUri = (msg) => decryptedMedia[msg.id] ?? null;
 
+  // Swipe right to go back
+  const swipeBackDM = useRef(PanResponder.create({
+    onMoveShouldSetPanResponder: (_, g) => g.dx > 20 && Math.abs(g.dy) < 60,
+    onPanResponderRelease: (_, g) => { if (g.dx > 60) onBack(); },
+  })).current;
+
   return (
     <ThemedSafeArea>
+      <View style={styles.flex} {...swipeBackDM.panHandlers}>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <AppHeader title={peer.display_name || peer.displayName || peer.username} onBack={onBack} />
       {disappear && (
@@ -3183,6 +3220,7 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
           </>
         )}
       </KeyboardAvoidingView>
+      </View>
     </ThemedSafeArea>
   );
 }
@@ -3543,8 +3581,15 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
   };
   const getGroupMediaUri = (msg) => decryptedMedia[msg.id] ?? null;
 
+  // Swipe right to go back
+  const swipeBackGroup = useRef(PanResponder.create({
+    onMoveShouldSetPanResponder: (_, g) => g.dx > 20 && Math.abs(g.dy) < 60,
+    onPanResponderRelease: (_, g) => { if (g.dx > 60) onBack(); },
+  })).current;
+
   return (
     <ThemedSafeArea>
+      <View style={styles.flex} {...swipeBackGroup.panHandlers}>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <AppHeader
         title={group.name}
@@ -3628,6 +3673,7 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
           </>
         )}
       </KeyboardAvoidingView>
+      </View>
     </ThemedSafeArea>
   );
 }
@@ -3980,6 +4026,11 @@ function TypingDots() {
 // ---------------------------------------------------------------------------
 function ProfileTab({ token, currentUser, onLogout }) {
   const { styles, C } = useSkin();
+  const mono = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
+  const BASE_URL_LOCAL = 'https://nano-synapsys-server.fly.dev';
+
+  // ── avatar state ───────────────────────────────────────────────────────
+  const [profileImageUri, setProfileImageUri] = useState(null);
 
   // ── invite / bio state ────────────────────────────────────────────────
   const [loading, setLoading]     = useState(false);
@@ -3987,10 +4038,11 @@ function ProfileTab({ token, currentUser, onLogout }) {
   const [inviteErr, setInviteErr] = useState('');
   const [bioAvailable, setBioAvailable] = useState(false);
   const [bioEnabled, setBioEnabled]     = useState(false);
-  const [showBioModal, setShowBioModal] = useState(false);
-  const [bioPassword, setBioPassword]   = useState('');
-  const [bioLoading, setBioLoading]     = useState(false);
-  const [bioErr, setBioErr]             = useState('');
+  // PIN modal for enabling Face ID
+  const [showPinForBio, setShowPinForBio] = useState(false);
+  const [bioPinEntry,   setBioPinEntry]   = useState('');
+  const [bioPinErr,     setBioPinErr]     = useState('');
+  const [bioPinLoading, setBioPinLoading] = useState(false);
   // ── Banner AI permissions ─────────────────────────────────────────────
   const [bpMsgs, setBpMsgs] = useState(false);
   const [bpSend, setBpSend] = useState(false);
@@ -4019,8 +4071,23 @@ function ProfileTab({ token, currentUser, onLogout }) {
       setBpSend(await loadBannerPerm(BANNER_PERM_SEND_KEY));
       setBpCal(await loadBannerPerm(BANNER_PERM_CAL_KEY));
       setBpCon(await loadBannerPerm(BANNER_PERM_CON_KEY));
+      // Load saved profile image
+      const uri = await SecureStore.getItemAsync(PROFILE_IMAGE_KEY);
+      if (uri) setProfileImageUri(uri);
     })();
   }, []);
+
+  const handlePickProfileImage = async () => {
+    const res = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      allowsEditing: true, aspect: [1, 1], quality: 0.8,
+    });
+    if (!res.canceled && res.assets?.[0]?.uri) {
+      const uri = res.assets[0].uri;
+      setProfileImageUri(uri);
+      await SecureStore.setItemAsync(PROFILE_IMAGE_KEY, uri);
+    }
+  };
 
   const handleSaveProfile = async () => {
     setSavingProfile(true); setSaveProfileErr(''); setSaveProfileOk('');
@@ -4037,18 +4104,32 @@ function ProfileTab({ token, currentUser, onLogout }) {
     finally { setSavingProfile(false); }
   };
 
-  const handleEnableBio = async () => {
-    if (!bioPassword.trim()) { setBioErr('Password is required.'); return; }
-    setBioLoading(true); setBioErr('');
+  // PIN confirm → then enable Face ID
+  const handleBioPinConfirm = async () => {
+    if (bioPinEntry.length !== 6) { setBioPinErr('Enter your 6-digit PIN'); return; }
+    setBioPinLoading(true); setBioPinErr('');
     try {
-      const data = await api('/auth/login', 'POST', { email: currentUser.email, password: bioPassword });
+      const deviceId = await getOrCreateDeviceId();
+      const res = await fetch(`${BASE_URL_LOCAL}/auth/pin-login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_id: deviceId, pin: bioPinEntry }),
+      });
+      if (!res.ok) { setBioPinErr('Incorrect PIN. Face ID not enabled.'); setBioPinEntry(''); setBioPinLoading(false); return; }
+      setShowPinForBio(false); setBioPinEntry(''); setBioPinErr('');
+      // Proceed with Face ID enrollment
+      await handleEnableBio();
+    } catch { setBioPinErr('Network error. Try again.'); }
+    finally { setBioPinLoading(false); }
+  };
+
+  const handleEnableBio = async () => {
+    try {
       await saveBioEnabled(true);
-      // Store the refresh token — never store the password
-      if (data.refresh) await saveBioRefresh(data.refresh);
-      setBioEnabled(true); setShowBioModal(false); setBioPassword('');
+      // Store refresh token if available (already stored during login)
+      setBioEnabled(true);
       Alert.alert('FACE ID ENABLED', 'Face ID will unlock the app on your next launch.');
-    } catch (e) { setBioErr(e.message || 'Incorrect password.'); }
-    finally { setBioLoading(false); }
+    } catch (e) { Alert.alert('ERROR', e.message || 'Could not enable Face ID.'); }
   };
 
   const handleDisableBio = () => {
@@ -4073,23 +4154,36 @@ function ProfileTab({ token, currentUser, onLogout }) {
   };
 
   const handleLogout = () => {
-    Alert.alert('LOGOUT', 'Disconnect from nano-SYNAPSYS?', [
+    Alert.alert('LOGOUT', 'Disconnect from SYNAPTYC?', [
       { text: 'CANCEL', style: 'cancel' },
       { text: 'LOGOUT', style: 'destructive', onPress: onLogout },
     ]);
   };
 
+  const AVATAR_COLORS_P = ['#1a472a','#14213d','#4a1942','#7b2d00','#003049','#1b4332','#312244','#3d1c02'];
+  const avatarBg = AVATAR_COLORS_P[currentUser.id % AVATAR_COLORS_P.length];
+  const initials = (currentUser.display_name || currentUser.username || '?')[0].toUpperCase();
+
   return (
     <ScrollView style={styles.flex} contentContainerStyle={styles.profileScroll}>
+
+      {/* ── CIRCULAR AVATAR ──────────────────────────────────────── */}
+      <TouchableOpacity onPress={handlePickProfileImage} style={{ alignItems: 'center', marginVertical: 24 }}>
+        {profileImageUri
+          ? <Image source={{ uri: profileImageUri }} style={{ width: 96, height: 96, borderRadius: 48 }} />
+          : <View style={{ width: 96, height: 96, borderRadius: 48, backgroundColor: avatarBg, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: C.accent }}>
+              <Text style={{ color: '#fff', fontSize: 38, fontWeight: '700', fontFamily: mono }}>{initials}</Text>
+            </View>
+        }
+        <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, marginTop: 6, letterSpacing: 0.5 }}>tap to change photo</Text>
+      </TouchableOpacity>
+      <Text style={{ fontFamily: mono, fontSize: 16, fontWeight: '700', color: C.text, textAlign: 'center', letterSpacing: 1, marginBottom: 4 }}>{currentUser.display_name || currentUser.displayName || currentUser.username}</Text>
+      <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, textAlign: 'center', letterSpacing: 1, marginBottom: 16 }}>@{currentUser.username}</Text>
 
       {/* ── READ-ONLY INFO ──────────────────────────────────────────── */}
       <View style={styles.profileCard}>
         <Text style={styles.profileLabel}>USERNAME</Text>
         <Text style={styles.profileValue}>{currentUser.username}</Text>
-      </View>
-      <View style={styles.profileCard}>
-        <Text style={styles.profileLabel}>EMAIL</Text>
-        <Text style={styles.profileValue}>{currentUser.email || '—'}</Text>
       </View>
       <View style={styles.profileDivider} />
 
@@ -4176,7 +4270,7 @@ function ProfileTab({ token, currentUser, onLogout }) {
       {bioAvailable && (
         bioEnabled
           ? <TouchableOpacity style={styles.bioDisableBtn} onPress={handleDisableBio}><Text style={styles.bioDisableBtnText}>DISABLE FACE ID LOGIN</Text></TouchableOpacity>
-          : <TouchableOpacity style={styles.primaryBtn} onPress={() => setShowBioModal(true)}><Text style={styles.primaryBtnText}>ENABLE FACE ID LOGIN</Text></TouchableOpacity>
+          : <TouchableOpacity style={styles.primaryBtn} onPress={() => { setBioPinEntry(''); setBioPinErr(''); setShowPinForBio(true); }}><Text style={styles.primaryBtnText}>ENABLE FACE ID LOGIN</Text></TouchableOpacity>
       )}
 
       <View style={styles.profileDivider} />
@@ -4212,21 +4306,54 @@ function ProfileTab({ token, currentUser, onLogout }) {
         <Text style={styles.logoutBtnText}>LOGOUT</Text>
       </TouchableOpacity>
 
-      <Modal visible={showBioModal} transparent animationType="fade"
-        onRequestClose={() => { setShowBioModal(false); setBioPassword(''); setBioErr(''); }}>
+      {/* ── PIN CONFIRMATION MODAL (for enabling Face ID) ─────────── */}
+      <Modal visible={showPinForBio} transparent animationType="fade"
+        onRequestClose={() => { setShowPinForBio(false); setBioPinEntry(''); setBioPinErr(''); }}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalBox}>
-            <Text style={styles.modalTitle}>ENABLE FACE ID</Text>
-            <Text style={styles.modalSub}>Enter your password to authorise Face ID login</Text>
-            <TextInput style={[styles.input, { marginTop: 16 }]} placeholder="PASSWORD" placeholderTextColor={C.muted}
-              value={bioPassword} onChangeText={setBioPassword} secureTextEntry autoFocus onSubmitEditing={handleEnableBio} />
-            <ErrText msg={bioErr} />
+            <Text style={styles.modalTitle}>CONFIRM PIN</Text>
+            <Text style={styles.modalSub}>Enter your 6-digit PIN to authorise Face ID</Text>
+
+            {/* 6-dot PIN indicator */}
+            <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 12, marginVertical: 20 }}>
+              {[0,1,2,3,4,5].map(i => (
+                <View key={i} style={{
+                  width: 14, height: 14, borderRadius: 7,
+                  backgroundColor: bioPinEntry.length > i ? C.accent : 'transparent',
+                  borderWidth: 2, borderColor: C.accent,
+                }} />
+              ))}
+            </View>
+
+            {/* Numpad */}
+            {[['1','2','3'],['4','5','6'],['7','8','9'],['','0','⌫']].map((row, ri) => (
+              <View key={ri} style={{ flexDirection: 'row', justifyContent: 'center', gap: 16, marginBottom: 10 }}>
+                {row.map((k, ki) => k === '' ? (
+                  <View key={ki} style={{ width: 64, height: 56 }} />
+                ) : (
+                  <TouchableOpacity key={ki}
+                    style={{ width: 64, height: 56, borderRadius: 12, backgroundColor: 'rgba(0,255,65,0.07)', borderWidth: 1, borderColor: 'rgba(0,255,65,0.2)', alignItems: 'center', justifyContent: 'center' }}
+                    onPress={() => {
+                      if (k === '⌫') { setBioPinEntry(p => p.slice(0, -1)); }
+                      else if (bioPinEntry.length < 6) { setBioPinEntry(p => p + k); }
+                    }}
+                  >
+                    <Text style={{ fontFamily: mono, fontSize: 20, color: C.text, fontWeight: '600' }}>{k}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            ))}
+
+            <ErrText msg={bioPinErr} />
             <View style={[styles.formBtnRow, { marginTop: 12 }]}>
-              <TouchableOpacity style={[styles.primaryBtn, { flex: 1, marginRight: 8 }, (bioLoading || !bioPassword.trim()) && styles.primaryBtnDisabled]}
-                onPress={handleEnableBio} disabled={bioLoading || !bioPassword.trim()}>
-                {bioLoading ? <Spinner /> : <Text style={styles.primaryBtnText}>CONFIRM</Text>}
+              <TouchableOpacity
+                style={[styles.primaryBtn, { flex: 1, marginRight: 8 }, (bioPinLoading || bioPinEntry.length !== 6) && styles.primaryBtnDisabled]}
+                onPress={handleBioPinConfirm}
+                disabled={bioPinLoading || bioPinEntry.length !== 6}
+              >
+                {bioPinLoading ? <Spinner /> : <Text style={styles.primaryBtnText}>CONFIRM</Text>}
               </TouchableOpacity>
-              <TouchableOpacity style={[styles.ghostBtn, { flex: 1 }]} onPress={() => { setShowBioModal(false); setBioPassword(''); setBioErr(''); }}>
+              <TouchableOpacity style={[styles.ghostBtn, { flex: 1 }]} onPress={() => { setShowPinForBio(false); setBioPinEntry(''); setBioPinErr(''); }}>
                 <Text style={styles.ghostBtnText}>CANCEL</Text>
               </TouchableOpacity>
             </View>
@@ -5193,11 +5320,11 @@ function HomeScreen({ token, currentUser, onLogout }) {
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <View style={styles.homeHeader}>
         <View>
-          <Text style={styles.homeTitle}>nano-SYNAPSYS</Text>
-          <Text style={styles.homeSubtitle}>AI EVOLUTION MESH</Text>
+          <Text style={styles.homeTitle}>SYNAPTYC</Text>
+          <Text style={styles.homeSubtitle}>by nano-SYNAPSYS</Text>
         </View>
         <TouchableOpacity onPress={() => { setShowSearch(true); setSearchQuery(''); }} style={{ padding: 8 }}>
-          <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 16, color: C.accent }}>⌕</Text>
+          <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 22, color: C.accent }}>⌕</Text>
         </TouchableOpacity>
       </View>
 
