@@ -16,6 +16,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  Dimensions,
   FlatList,
   Image,
   KeyboardAvoidingView,
@@ -639,6 +640,7 @@ const NOTIF_KEY       = 'nano_notif_enabled';
 const BANNER_PERM_MSGS_KEY = 'banner_perm_msgs';
 const BANNER_PERM_SEND_KEY = 'banner_perm_send';
 const BANNER_PERM_CAL_KEY  = 'banner_perm_cal';
+const BANNER_PERM_CON_KEY  = 'banner_perm_con';
 
 const DISAPPEAR_OPTIONS = [
   { label: 'OFF',     value: null   },
@@ -1042,7 +1044,7 @@ function SynapseTexture({ accentColor }) {
       <Rect width="100%" height="100%" fill="url(#sg)" />
 
       {/* Central synapse mark — watermark at screen center */}
-      <G opacity="0.07" transform="translate(50%, 50%) translate(188, 400)">
+      <G opacity="0.07" transform={`translate(${Dimensions.get('window').width / 2}, ${Dimensions.get('window').height / 2})`}>
         {/* Outer connecting hexagon */}
         <Polygon points={hexPts} stroke={accentColor} strokeWidth="1" fill="none" />
         {/* Radial arms + branches */}
@@ -1412,7 +1414,6 @@ function GroupMembersModal({ token, group, currentUser, visible, onClose }) {
 
 const ICON_COMPONENTS = {
   CHATS:    IconChats,
-  CONTACTS: IconContacts,
   GROUPS:   IconGroups,
   BOT:      IconBot,
   PROFILE:  IconProfile,
@@ -1422,7 +1423,7 @@ const ICON_COMPONENTS = {
 // ---------------------------------------------------------------------------
 // BOTTOM TAB BAR  (floating, rounded, back-shadowed)
 // ---------------------------------------------------------------------------
-const TABS = ['CHATS', 'CONTACTS', 'GROUPS', 'BOT', 'PROFILE', 'SETTINGS'];
+const TABS = ['CHATS', 'GROUPS', 'BOT', 'PROFILE', 'SETTINGS'];
 
 function TabBar({ active, onChange, unread = {} }) {
   const { styles, C } = useSkin();
@@ -1855,7 +1856,7 @@ function SwipeableRow({ children, rightLabel = 'DELETE', rightColor, onAction, d
     onStartShouldSetPanResponder: () => false,
     // Claim horizontal gestures; let vertical scroll through unimpeded
     onMoveShouldSetPanResponder: (_, { dx, dy }) =>
-      !R.current.disabled && Math.abs(dx) > 14 && Math.abs(dx) > Math.abs(dy) * 2.5,
+      !R.current.disabled && Math.abs(dx) > 8 && Math.abs(dx) > Math.abs(dy) * 2,
 
     onPanResponderGrant: () => {
       fired.current = false;
@@ -1869,11 +1870,11 @@ function SwipeableRow({ children, rightLabel = 'DELETE', rightColor, onAction, d
 
     onPanResponderRelease: (_, { dx, vx }) => {
       const cur = Math.min(0, dragStart.current + dx);
-      if (vx < -0.5 || cur < -_FULL_SWIPE) {
+      if (vx < -0.4 || cur < -_FULL_SWIPE) {
         // Hard/fast swipe → fly off and fire action immediately
         R.current.slideOff();
-      } else if (vx < -0.3 || cur < -(_SWIPE_W / 2)) {
-        // Medium swipe → reveal the button
+      } else if (vx < -0.15 || cur < -(_SWIPE_W * 0.35)) {
+        // Light swipe → reveal the button (trigger after ~31px drag)
         R.current.snapTo(-_SWIPE_W);
       } else {
         R.current.snapTo(0);
@@ -1914,12 +1915,348 @@ function SwipeableRow({ children, rightLabel = 'DELETE', rightColor, onAction, d
 // ---------------------------------------------------------------------------
 // CHATS TAB
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// PHONE CONTACTS BOTTOM SHEET
+// ---------------------------------------------------------------------------
+const _PC_KEY = 'nano_phone_statuses';
+const _nrmPh  = (p) => (p || '').replace(/[\s\-().+]/g, '');
+
+async function _pcLoad() {
+  try {
+    const raw = await SecureStore.getItemAsync(_PC_KEY);
+    if (!raw) return {};
+    const map = JSON.parse(raw);
+    const now = Date.now();
+    let changed = false;
+    for (const k of Object.keys(map)) {
+      if (map[k].s === 'i' && map[k].e && map[k].e < now) { delete map[k]; changed = true; }
+    }
+    if (changed) SecureStore.setItemAsync(_PC_KEY, JSON.stringify(map)).catch(() => {});
+    return map;
+  } catch { return {}; }
+}
+
+async function _pcSave(phone, entry) {
+  const key = _nrmPh(phone);
+  if (!key) return;
+  const map = await _pcLoad();
+  map[key] = entry;
+  try { await SecureStore.setItemAsync(_PC_KEY, JSON.stringify(map)); } catch {}
+}
+
+function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) {
+  const { styles, C } = useSkin();
+  const mono     = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
+  const screenH  = Dimensions.get('window').height;
+
+  const [deviceContacts, setDeviceContacts] = useState([]);
+  const [contactsLoading, setContactsLoading] = useState(false);
+  const [contactsErr,     setContactsErr]     = useState('');
+  const [contactsQuery,   setContactsQuery]   = useState('');
+  const [phoneStatuses,   setPhoneStatuses]   = useState({});
+  const [inviting,        setInviting]        = useState(null);
+  const [appContactIds,   setAppContactIds]   = useState(new Set());
+  const [toast,           setToast]           = useState('');   // inline feedback bar
+  const toastTimer = useRef(null);
+
+  const showToast = (msg) => {
+    setToast(msg);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(''), 2800);
+  };
+
+  useEffect(() => {
+    if (visible) { loadAll(); }
+    else { setContactsQuery(''); setContactsErr(''); }
+  }, [visible]);
+
+  const loadAll = async () => {
+    // Fetch accepted app contacts for green LED check
+    try {
+      const data = await api('/api/contacts', 'GET', null, token);
+      setAppContactIds(new Set((Array.isArray(data) ? data : []).map(c => c.userId)));
+    } catch {}
+
+    // Load persisted statuses
+    const loaded = await _pcLoad();
+    setPhoneStatuses(loaded);
+
+    // Request contacts permission
+    const { status } = await Contacts.requestPermissionsAsync();
+    if (status !== 'granted') {
+      setContactsErr('Contacts permission denied.\nGo to Settings → Expo Go → Contacts → Allow.');
+      return;
+    }
+
+    setContactsLoading(true);
+    try {
+      const result = await Contacts.getContactsAsync({
+        fields: [
+          Contacts.Fields.PhoneNumbers,
+          Contacts.Fields.Name,
+          Contacts.Fields.FirstName,
+          Contacts.Fields.LastName,
+        ],
+      });
+      const raw = Array.isArray(result?.data) ? result.data
+                : Array.isArray(result)        ? result
+                : [];
+      const list = raw
+        .filter(c => c.phoneNumbers?.length > 0)
+        .map(c => ({
+          id:    c.id || String(Math.random()),
+          name:  (c.name || `${c.firstName || ''} ${c.lastName || ''}`.trim()) || 'Unknown',
+          phone: c.phoneNumbers[0].number || '',
+        }))
+        .filter(c => c.phone)
+        .sort((a, b) => a.name.localeCompare(b.name));   // A → Z
+      setDeviceContacts(list);
+    } catch (e) {
+      setContactsErr('Could not load contacts: ' + (e?.message || String(e)));
+    } finally {
+      setContactsLoading(false);
+    }
+  };
+
+  const getPhoneStatus = (phone) => {
+    const entry = phoneStatuses[_nrmPh(phone)];
+    if (!entry) return null;
+    if (entry.s === 'i' && entry.e && entry.e < Date.now()) return null;
+    return entry.s;  // 'c' = green | 'i' = amber
+  };
+
+  const saveStatus = async (phone, entry) => {
+    await _pcSave(phone, entry);
+    setPhoneStatuses(prev => ({ ...prev, [_nrmPh(phone)]: entry }));
+  };
+
+  const addContact = async (userId, phone) => {
+    await api('/api/contacts/request', 'POST', { userId }, token);
+    setAppContactIds(prev => new Set([...prev, userId]));
+    if (phone) await saveStatus(phone, { s: 'c' });
+  };
+
+  // Clear a pending invite locally so the contact can be invited again
+  const cancelInvite = async (phone) => {
+    const map = await _pcLoad();
+    const key = _nrmPh(phone);
+    delete map[key];
+    try { await SecureStore.setItemAsync(_PC_KEY, JSON.stringify(map)); } catch {}
+    setPhoneStatuses(prev => { const n = { ...prev }; delete n[key]; return n; });
+  };
+
+  const findOnApp = async (contact) => {
+    const q = contact.name.split(' ')[0];
+    if (q.length < 2) {
+      Alert.alert('NOT ON APP YET', `"${contact.name}" doesn't appear to be on nano-SYNAPSYS.\n\nSend them an invite?`, [
+        { text: 'CANCEL', style: 'cancel' },
+        { text: 'SEND INVITE', onPress: () => sendSMSInvite(contact) },
+      ]);
+      return;
+    }
+    try {
+      const data = await api(`/api/users/search?q=${encodeURIComponent(q)}`, 'GET', null, token);
+      const all     = Array.isArray(data) ? data : [];
+      const newOnes = all.filter(u => !appContactIds.has(u.id));
+      const known   = all.filter(u =>  appContactIds.has(u.id));
+
+      if (all.length === 0) {
+        Alert.alert('NOT ON APP YET',
+          `"${contact.name}" doesn't have nano-SYNAPSYS.\n\nSend them an invite?`,
+          [{ text: 'CANCEL', style: 'cancel' }, { text: 'SEND INVITE', onPress: () => sendSMSInvite(contact) }]);
+      } else if (newOnes.length === 0) {
+        await saveStatus(contact.phone, { s: 'c' });
+        showToast(`✓ ${known[0].displayName || known[0].username} is already in your contacts`);
+      } else if (newOnes.length === 1) {
+        await addContact(newOnes[0].id, contact.phone);
+        showToast(`✓ ${newOnes[0].displayName || newOnes[0].username} added to contacts`);
+      } else {
+        Alert.alert('MULTIPLE MATCHES', `Found ${newOnes.length} users matching "${q}". Ask them to share their exact username.`);
+      }
+    } catch (e) { Alert.alert('ERROR', e.message); }
+  };
+
+  const sendSMSInvite = async (contact) => {
+    setInviting(contact.id);
+    try {
+      const data = await api('/api/invites', 'POST', {}, token);
+      const inviteUrl = data.invite_url || data.url;
+      if (!inviteUrl) { Alert.alert('ERROR', 'Could not generate invite link.'); return; }
+
+      const senderName = currentUser?.display_name || currentUser?.username || 'A friend';
+      const tkMatch    = inviteUrl.match(/[?&]invite=([A-Za-z0-9_=-]+)/);
+      const deepLink   = tkMatch ? `nanosynapsys://join/${tkMatch[1]}` : null;
+      const msg = deepLink
+        ? `${senderName} invited you to nano-SYNAPSYS.\n\n1. Download: https://apps.apple.com/app/id6759710350\n2. Tap to join: ${deepLink}\n\nOr open: ${inviteUrl}\n\nLink expires in 25 minutes — one-time use.`
+        : `${senderName} invited you to nano-SYNAPSYS. Join here: ${inviteUrl}\n(Expires in 25 min, one-time use)`;
+
+      // Strip all non-digit chars except leading + for international numbers
+      const phone = (contact.phone || '').replace(/(?!^\+)[^\d]/g, '');
+
+      let sent = false;
+      const smsAvail = await SMS.isAvailableAsync();
+      if (smsAvail) {
+        const { result } = await SMS.sendSMSAsync([phone], msg);
+        if (result === 'sent' || result === 'unknown') {
+          sent = true;
+          showToast(`✓ Invite sent to ${contact.name}`);
+        }
+        // 'cancelled' = user backed out of SMS composer — do nothing
+      } else {
+        // Fallback: copy link to clipboard
+        await Clipboard.setStringAsync(inviteUrl);
+        sent = true;
+        showToast(`Link copied — paste it to ${contact.name}`);
+      }
+      if (sent) await saveStatus(contact.phone, { s: 'i', e: Date.now() + 25 * 60 * 1000 });
+    } catch (e) { Alert.alert('ERROR', e.message || 'Failed to send invite.'); }
+    finally { setInviting(null); }
+  };
+
+  // Reset amber status + immediately resend invite
+  const resendInvite = async (contact) => {
+    await cancelInvite(contact.phone);
+    await sendSMSInvite(contact);
+  };
+
+  const filtered = deviceContacts.filter(c =>
+    !contactsQuery.trim() ||
+    c.name.toLowerCase().includes(contactsQuery.toLowerCase()) ||
+    c.phone.includes(contactsQuery)
+  );
+
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <View style={{ flex: 1, justifyContent: 'flex-end' }}>
+        <TouchableOpacity style={{ flex: 1 }} onPress={onClose} activeOpacity={1} />
+        <View style={{ backgroundColor: C.surface, borderTopLeftRadius: 16, borderTopRightRadius: 16, height: screenH * 0.86 }}>
+          {/* Drag handle */}
+          <View style={{ alignItems: 'center', paddingTop: 8, paddingBottom: 4 }}>
+            <View style={{ width: 36, height: 4, borderRadius: 2, backgroundColor: C.border }} />
+          </View>
+          {/* Header */}
+          <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingBottom: 10 }}>
+            <Text style={{ fontFamily: mono, fontSize: 13, color: C.accent, fontWeight: '700', letterSpacing: 1, flex: 1 }}>MY PHONE CONTACTS</Text>
+            <TouchableOpacity onPress={onClose}><Text style={{ fontFamily: mono, fontSize: 16, color: C.muted }}>✕</Text></TouchableOpacity>
+          </View>
+          {/* Inline toast */}
+          {toast ? (
+            <View style={{ backgroundColor: C.border, marginHorizontal: 16, marginBottom: 8, paddingHorizontal: 12, paddingVertical: 7, borderRadius: 8, borderLeftWidth: 3, borderLeftColor: C.accent }}>
+              <Text style={{ fontFamily: mono, fontSize: 11, color: C.accent }}>{toast}</Text>
+            </View>
+          ) : null}
+          {/* LED legend */}
+          <View style={{ flexDirection: 'row', gap: 14, paddingHorizontal: 16, paddingBottom: 10 }}>
+            {[{ color: C.accent, label: 'CONTACT' }, { color: C.amber, label: 'INVITE SENT' }, { color: C.red, label: 'NOT CONNECTED' }].map(({ color, label }) => (
+              <View key={label} style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
+                <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: color }} />
+                <Text style={{ fontFamily: mono, fontSize: 9, color: C.dim }}>{label}</Text>
+              </View>
+            ))}
+          </View>
+          {/* Search */}
+          <View style={{ paddingHorizontal: 16, paddingBottom: 8 }}>
+            <TextInput
+              style={styles.input}
+              placeholder="SEARCH CONTACTS..."
+              placeholderTextColor={C.muted}
+              value={contactsQuery}
+              onChangeText={setContactsQuery}
+              autoCorrect={false}
+              autoCapitalize="none"
+            />
+          </View>
+          {/* Body */}
+          {contactsLoading ? (
+            <View style={{ paddingVertical: 40, alignItems: 'center' }}><Spinner size="large" /></View>
+          ) : contactsErr ? (
+            <Text style={{ fontFamily: mono, fontSize: 11, color: C.red, padding: 16 }}>{contactsErr}</Text>
+          ) : (
+            <FlatList
+              data={filtered}
+              keyExtractor={c => c.id}
+              style={{ flex: 1 }}
+              keyboardShouldPersistTaps="handled"
+              ListEmptyComponent={<Text style={styles.emptyText}>NO CONTACTS FOUND</Text>}
+              ListHeaderComponent={deviceContacts.length > 0 ? (
+                <Text style={{ fontFamily: mono, fontSize: 9, color: C.dim, paddingHorizontal: 16, paddingTop: 2, paddingBottom: 6 }}>
+                  {deviceContacts.length} CONTACT{deviceContacts.length !== 1 ? 'S' : ''}
+                </Text>
+              ) : null}
+              renderItem={({ item: c }) => {
+                const ps = getPhoneStatus(c.phone);
+                const ledColor = ps === 'c' ? C.accent : ps === 'i' ? C.amber : C.red;
+                return (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: C.border }}>
+                    <View style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: ledColor, marginRight: 12, flexShrink: 0 }} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={{ fontFamily: mono, fontSize: 13, color: C.bright }}>{c.name}</Text>
+                      <Text style={{ fontFamily: mono, fontSize: 10, color: C.dim }}>{c.phone}</Text>
+                    </View>
+                    {ps === 'c' ? (
+                      <Text style={{ fontFamily: mono, fontSize: 10, color: C.accent }}>✓ CONTACT</Text>
+                    ) : ps === 'i' ? (
+                      /* Amber: invite pending — allow cancelling and resending */
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                        <Text style={{ fontFamily: mono, fontSize: 9, color: C.amber }}>PENDING</Text>
+                        <TouchableOpacity
+                          style={{ borderWidth: 1, borderColor: C.amber, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 3 }}
+                          onPress={() => resendInvite(c)}
+                          disabled={inviting === c.id}
+                        >
+                          {inviting === c.id
+                            ? <ActivityIndicator size="small" color={C.amber} style={{ width: 28 }} />
+                            : <Text style={{ fontFamily: mono, fontSize: 9, color: C.amber }}>RESEND</Text>}
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={{ paddingHorizontal: 4, paddingVertical: 3 }}
+                          onPress={() => cancelInvite(c.phone)}
+                        >
+                          <Text style={{ fontFamily: mono, fontSize: 9, color: C.dim }}>✕</Text>
+                        </TouchableOpacity>
+                      </View>
+                    ) : (
+                      /* Red: not connected — offer FIND + INVITE */
+                      <View style={{ flexDirection: 'row', gap: 6 }}>
+                        <TouchableOpacity
+                          style={{ borderWidth: 1, borderColor: C.accent, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 3 }}
+                          onPress={() => findOnApp(c)}
+                        >
+                          <Text style={{ fontFamily: mono, fontSize: 10, color: C.accent }}>FIND</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={{ borderWidth: 1, borderColor: C.amber, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 3 }}
+                          onPress={() => sendSMSInvite(c)}
+                          disabled={inviting === c.id}
+                        >
+                          {inviting === c.id
+                            ? <ActivityIndicator size="small" color={C.amber} style={{ width: 28 }} />
+                            : <Text style={{ fontFamily: mono, fontSize: 10, color: C.amber }}>INVITE</Text>}
+                        </TouchableOpacity>
+                      </View>
+                    )}
+                  </View>
+                );
+              }}
+            />
+          )}
+          <View style={{ height: 24 }} />
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CHATS TAB
+// ---------------------------------------------------------------------------
 function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
   const { styles, C } = useSkin();
-  const [users, setUsers]         = useState([]);
-  const [loading, setLoading]     = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [err, setErr]             = useState('');
+  const [users,          setUsers]          = useState([]);
+  const [loading,        setLoading]        = useState(true);
+  const [refreshing,     setRefreshing]     = useState(false);
+  const [err,            setErr]            = useState('');
+  const [showContacts,   setShowContacts]   = useState(false);
 
   const fetchUsers = useCallback(async (isRefresh = false) => {
     if (isRefresh) setRefreshing(true); else setLoading(true);
@@ -1934,13 +2271,12 @@ function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
   useEffect(() => { fetchUsers(); }, [fetchUsers]);
 
   const deleteChat = useCallback(async (user) => {
-    // Optimistic removal — row already flew off screen via SwipeableRow.slideOff
     setUsers(prev => prev.filter(u => u.id !== user.id));
     try {
       await api(`/api/messages/delete/${user.id}`, 'DELETE', null, token);
     } catch (e) {
       setErr(e.message);
-      fetchUsers(); // restore list on failure
+      fetchUsers();
     }
   }, [token, fetchUsers]);
 
@@ -1952,7 +2288,7 @@ function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
       <FlatList
         data={users} keyExtractor={(u) => String(u.id)}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => fetchUsers(true)} tintColor={C.accent} />}
-        ListEmptyComponent={<Text style={styles.emptyText}>NO USERS FOUND</Text>}
+        ListEmptyComponent={<Text style={styles.emptyText}>NO CHATS YET{'\n'}Tap + to add contacts</Text>}
         renderItem={({ item }) => {
           const cnt = unread[`dm_${item.id}`] || 0;
           return (
@@ -1978,6 +2314,29 @@ function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
           );
         }}
         ItemSeparatorComponent={() => <View style={styles.separator} />}
+      />
+
+      {/* Floating + button */}
+      <TouchableOpacity
+        onPress={() => setShowContacts(true)}
+        style={{
+          position: 'absolute', bottom: 20, right: 20,
+          width: 52, height: 52, borderRadius: 26,
+          backgroundColor: C.accent,
+          justifyContent: 'center', alignItems: 'center',
+          shadowColor: C.accent, shadowOpacity: 0.5, shadowRadius: 10, shadowOffset: { width: 0, height: 4 },
+          elevation: 8,
+        }}
+      >
+        <Text style={{ fontSize: 30, color: '#050f05', fontWeight: '700', lineHeight: 34 }}>+</Text>
+      </TouchableOpacity>
+
+      <PhoneContactsSheet
+        visible={showContacts}
+        onClose={() => { setShowContacts(false); fetchUsers(); }}
+        token={token}
+        currentUser={currentUser}
+        onOpenDM={onOpenDM}
       />
     </View>
   );
@@ -2599,7 +2958,7 @@ function BotTab({ token, wsRef }) {
   const mono = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
   const [messages, setMessages] = useState([{
     id: 0, role: 'bot',
-    content: 'BANNER AI ONLINE.\n\nI\'m your unlimited AI assistant — ask me anything, send a photo for analysis, and enable permissions in Settings to let me read your messages, send on your behalf, or manage your calendar.',
+    content: 'Hey, I\'m Banner — your personal AI assistant. Ask me anything, send a photo, or just tell me what you need help with.',
     ts: new Date().toISOString(),
   }]);
   const [text,          setText]          = useState('');
@@ -2610,8 +2969,9 @@ function BotTab({ token, wsRef }) {
   const [bpMsgs,        setBpMsgs]        = useState(false);
   const [bpSend,        setBpSend]        = useState(false);
   const [bpCal,         setBpCal]         = useState(false);
+  const [bpCon,         setBpCon]         = useState(false);
   const [pendingAction, setPendingAction] = useState(null);
-  // contacts list: fetched when bpSend is on so executeAction can look up IDs
+  // contacts list: fetched when bpSend or bpCon is on so executeAction can look up IDs
   const [contacts,      setContacts]      = useState([]);
   const listRef     = useRef(null);
   const typingTimer = useRef(null);
@@ -2626,16 +2986,17 @@ function BotTab({ token, wsRef }) {
       setBpMsgs(await loadBannerPerm(BANNER_PERM_MSGS_KEY));
       setBpSend(await loadBannerPerm(BANNER_PERM_SEND_KEY));
       setBpCal(await loadBannerPerm(BANNER_PERM_CAL_KEY));
+      setBpCon(await loadBannerPerm(BANNER_PERM_CON_KEY));
     })();
   }, []);
 
-  // Fetch contacts when send permission is active (needed for executeAction to resolve IDs)
+  // Fetch contacts when send or contacts permission is active (needed for executeAction to resolve IDs)
   useEffect(() => {
-    if (!bpSend) return;
+    if (!bpSend && !bpCon) return;
     api('/api/contacts', 'GET', null, token)
       .then(data => { if (Array.isArray(data)) setContacts(data); })
       .catch(() => {});
-  }, [bpSend, token]);
+  }, [bpSend, bpCon, token]);
 
   useEffect(() => { return () => { if (typingTimer.current) clearTimeout(typingTimer.current); }; }, []);
 
@@ -2721,7 +3082,11 @@ function BotTab({ token, wsRef }) {
     typingTimer.current = setTimeout(async () => {
       try {
         const calendar_events = await getCalendarEvents();
-        const body = { message: content || 'Describe this image.', calendar_events };
+        const body = {
+          message: content || 'Describe this image.',
+          calendar_events,
+          permissions: { msgs: bpMsgs, send: bpSend, cal: bpCal, contacts: bpCon },
+        };
         if (imgToSend?.base64) { body.image_base64 = imgToSend.base64; body.image_mime = imgToSend.mimeType || 'image/jpeg'; }
         const data = await api('/api/bot/chat', 'POST', body, token);
         const raw  = data.reply || '...';
@@ -2775,7 +3140,7 @@ function BotTab({ token, wsRef }) {
   };
 
   const canSend = (text.trim().length > 0 || pendingImage !== null) && !loading;
-  const permTags = [bpMsgs && 'MSGS', bpSend && 'SEND', bpCal && 'CAL'].filter(Boolean).join(' \u00B7 ');
+  const permTags = [bpCon && 'CON', bpMsgs && 'MSGS', bpSend && 'SEND', bpCal && 'CAL'].filter(Boolean).join(' \u00B7 ');
 
   return (
     <View style={styles.flex}>
@@ -2899,6 +3264,7 @@ function ProfileTab({ token, currentUser, onLogout }) {
   const [bpMsgs, setBpMsgs] = useState(false);
   const [bpSend, setBpSend] = useState(false);
   const [bpCal,  setBpCal]  = useState(false);
+  const [bpCon,  setBpCon]  = useState(false);
 
   // ── editable profile fields ───────────────────────────────────────────
   const [displayName,     setDisplayName]     = useState('');
@@ -2921,6 +3287,7 @@ function ProfileTab({ token, currentUser, onLogout }) {
       setBpMsgs(await loadBannerPerm(BANNER_PERM_MSGS_KEY));
       setBpSend(await loadBannerPerm(BANNER_PERM_SEND_KEY));
       setBpCal(await loadBannerPerm(BANNER_PERM_CAL_KEY));
+      setBpCon(await loadBannerPerm(BANNER_PERM_CON_KEY));
     })();
   }, []);
 
@@ -3088,6 +3455,7 @@ function ProfileTab({ token, currentUser, onLogout }) {
         Allow Banner AI to access your data and take actions on your behalf. Actions always require your confirmation.
       </Text>
       {[
+        { key: BANNER_PERM_CON_KEY,  label: 'CONTACTS ACCESS',    desc: 'Banner can look up your contacts by name to help you message or reference them.', val: bpCon, set: setBpCon },
         { key: BANNER_PERM_MSGS_KEY, label: 'READ CONVERSATIONS', desc: 'Banner can read recent messages to provide context-aware responses.', val: bpMsgs, set: setBpMsgs },
         { key: BANNER_PERM_SEND_KEY, label: 'SEND MESSAGES',      desc: 'Banner can send messages as you — confirmation required each time.', val: bpSend, set: setBpSend },
         { key: BANNER_PERM_CAL_KEY,  label: 'CALENDAR ACCESS',    desc: 'Banner can read your schedule and create events — confirmation required.', val: bpCal, set: setBpCal },
@@ -3160,6 +3528,7 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
   const [contactsQuery,  setContactsQuery]  = useState('');
   const [inviting,       setInviting]       = useState(null);
   const [phoneStatuses,  setPhoneStatuses]  = useState({});   // normalizedPhone → { s:'c'|'i', e?:ms }
+  const [contactsErr,    setContactsErr]    = useState('');
   const searchDebounceRef = useRef(null);
 
   // ── Phone status helpers ─────────────────────────────────────────
@@ -3269,23 +3638,34 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
     // Load persisted phone statuses (contact / pending invite)
     const loaded = await _loadPhoneStatuses();
     setPhoneStatuses(loaded);
+    setContactsErr('');
     setShowInvite(true);
     setContactsLoading(true);
     try {
-      const { data } = await Contacts.getContactsAsync({
-        fields: [Contacts.Fields.PhoneNumbers, Contacts.Fields.Name],
-        sort: Contacts.SortTypes.FirstName,
+      // Note: no `sort` param — it can cause a native crash on some iOS versions
+      const result = await Contacts.getContactsAsync({
+        fields: [
+          Contacts.Fields.PhoneNumbers,
+          Contacts.Fields.Name,
+          Contacts.Fields.FirstName,
+          Contacts.Fields.LastName,
+        ],
       });
-      const withPhones = data
+      const raw = Array.isArray(result?.data) ? result.data : (Array.isArray(result) ? result : []);
+      const withPhones = raw
         .filter(c => c.phoneNumbers?.length > 0)
         .map(c => ({
-          id: c.id,
-          name: (c.name || ((c.firstName || '') + ' ' + (c.lastName || '')).trim()) || 'Unknown',
-          phone: c.phoneNumbers[0].number,
-        }));
+          id:    c.id || String(Math.random()),
+          name:  (c.name || `${c.firstName || ''} ${c.lastName || ''}`.trim()) || 'Unknown',
+          phone: c.phoneNumbers[0].number || '',
+        }))
+        .filter(c => c.phone);  // skip if phone is empty string
       setDeviceContacts(withPhones);
+      if (withPhones.length === 0 && raw.length > 0) {
+        setContactsErr(`Found ${raw.length} contacts but none have phone numbers.`);
+      }
     } catch (e) {
-      Alert.alert('ERROR', 'Failed to load contacts: ' + e.message);
+      setContactsErr('Could not load contacts: ' + (e?.message || String(e)));
     } finally {
       setContactsLoading(false);
     }
@@ -3524,6 +3904,14 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
               <View style={{ paddingVertical: 30, alignItems: 'center' }}><Spinner size="large" /></View>
             ) : (
               <ScrollView style={{ flex: 1 }} keyboardShouldPersistTaps="handled">
+                {contactsErr ? (
+                  <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 11, color: C.red, paddingHorizontal: 4, paddingBottom: 8 }}>{contactsErr}</Text>
+                ) : null}
+                {!contactsErr && deviceContacts.length > 0 && (
+                  <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 9, color: C.dim, paddingHorizontal: 4, paddingBottom: 6 }}>
+                    {deviceContacts.length} CONTACT{deviceContacts.length !== 1 ? 'S' : ''} WITH PHONE NUMBERS
+                  </Text>
+                )}
                 {deviceContacts
                   .filter(c => !contactsQuery.trim() || c.name.toLowerCase().includes(contactsQuery.toLowerCase()) || c.phone.includes(contactsQuery))
                   .map(c => {
@@ -3930,7 +4318,6 @@ function HomeScreen({ token, currentUser, onLogout }) {
       <KeyboardAvoidingView style={styles.flex} behavior={KAV_BEHAVIOR} enabled={activeTab === 'BOT'}>
         <View style={styles.flex}>
           {activeTab === 'CHATS'    && <ChatsTab token={token} currentUser={currentUser} onOpenDM={openDM} unread={unreadCounts} />}
-          {activeTab === 'CONTACTS' && <ContactsTab token={token} currentUser={currentUser} onOpenDM={(peer) => { openDM(peer); setActiveTab('CHATS'); }} />}
           {activeTab === 'GROUPS'   && <GroupsTab token={token} onOpenGroup={openGroup} unread={unreadCounts} />}
           {activeTab === 'BOT'      && <BotTab token={token} wsRef={wsRef} currentUser={currentUser} />}
           {activeTab === 'PROFILE'  && <ProfileTab token={token} currentUser={currentUser} onLogout={onLogout} />}
