@@ -1981,11 +1981,16 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
     const loaded = await _pcLoad();
     setPhoneStatuses(loaded);
 
-    // Request contacts permission
-    const { status } = await Contacts.requestPermissionsAsync();
-    if (status !== 'granted') {
+    // Request contacts permission (returns accessPrivileges on iOS 18+)
+    const permResult = await Contacts.requestPermissionsAsync();
+    if (permResult.status !== 'granted') {
       setContactsErr('CONTACTS PERMISSION DENIED');
       return;
+    }
+
+    // iOS 18+ limited access — user chose specific contacts only
+    if (permResult.accessPrivileges === 'limited') {
+      setContactsErr('LIMITED_ACCESS');
     }
 
     setContactsLoading(true);
@@ -2009,7 +2014,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
           phone: c.phoneNumbers[0].number || '',
         }))
         .filter(c => c.phone)
-        .sort((a, b) => a.name.localeCompare(b.name));   // A → Z
+        .sort((a, b) => a.name.localeCompare(b.name));
       setDeviceContacts(list);
     } catch (e) {
       setContactsErr('Could not load contacts: ' + (e?.message || String(e)));
@@ -2178,11 +2183,13 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
           {/* Body */}
           {contactsLoading ? (
             <View style={{ paddingVertical: 40, alignItems: 'center' }}><Spinner size="large" /></View>
-          ) : contactsErr ? (
+          ) : contactsErr && contactsErr !== 'LIMITED_ACCESS' ? (
             <View style={{ padding: 24, alignItems: 'center', gap: 14 }}>
-              <Text style={{ fontFamily: mono, fontSize: 11, color: C.red, textAlign: 'center', letterSpacing: 1 }}>{contactsErr}</Text>
+              <Text style={{ fontFamily: mono, fontSize: 11, color: C.red, textAlign: 'center', letterSpacing: 1 }}>
+                CONTACTS PERMISSION DENIED
+              </Text>
               <Text style={{ fontFamily: mono, fontSize: 10, color: C.dim, textAlign: 'center', lineHeight: 16 }}>
-                {'Allow contacts access in:\nSettings → nano-SYNAPSYS → Contacts'}
+                {'Enable contacts access in:\nSettings → nano-SYNAPSYS → Contacts'}
               </Text>
               <TouchableOpacity
                 onPress={() => Linking.openURL('app-settings:')}
@@ -2192,6 +2199,20 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
               </TouchableOpacity>
             </View>
           ) : (
+            <>
+              {contactsErr === 'LIMITED_ACCESS' && (
+                <TouchableOpacity
+                  onPress={async () => {
+                    try { await Contacts.presentAccessPickerAsync(); await loadAll(); } catch {}
+                  }}
+                  style={{ flexDirection: 'row', alignItems: 'center', marginHorizontal: 16, marginBottom: 8, padding: 10, borderRadius: 6, borderWidth: 1, borderColor: C.amber, gap: 8 }}
+                >
+                  <Text style={{ fontFamily: mono, fontSize: 10, color: C.amber, flex: 1, lineHeight: 15 }}>
+                    {'LIMITED ACCESS — only selected contacts visible.\nTap to expand access.'}
+                  </Text>
+                  <Text style={{ fontFamily: mono, fontSize: 9, color: C.amber }}>EXPAND ›</Text>
+                </TouchableOpacity>
+              )}
             <FlatList
               data={filtered}
               keyExtractor={c => c.id}
@@ -2259,6 +2280,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
                 );
               }}
             />
+            </>
           )}
           <View style={{ height: 24 }} />
         </View>
