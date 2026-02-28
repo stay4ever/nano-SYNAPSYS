@@ -4266,20 +4266,24 @@ function ProfileTab({ token, currentUser, onLogout }) {
 
   const handlePickProfileImage = async () => {
     const res = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: true, aspect: [1, 1], quality: 0.8,
+      mediaTypes: 'images',
+      allowsEditing: true, aspect: [1, 1], quality: 0.7, base64: true,
     });
-    if (!res.canceled && res.assets?.[0]?.uri) {
-      const srcUri = res.assets[0].uri;
-      // Unique filename busts React Native image cache; permanent path survives restarts
+    if (!res.canceled && res.assets?.[0]) {
+      const asset = res.assets[0];
       const destUri = FileSystem.documentDirectory + `profile_avatar_${Date.now()}.jpg`;
-      let finalUri = srcUri; // fallback: use src if copy fails
       try {
-        await FileSystem.copyAsync({ from: srcUri, to: destUri });
-        finalUri = destUri;
-      } catch { /* copy failed — use srcUri for this session */ }
-      setProfileImageUri(finalUri);
-      await SecureStore.setItemAsync(PROFILE_IMAGE_KEY, finalUri);
+        if (asset.base64) {
+          await FileSystem.writeAsStringAsync(destUri, asset.base64, { encoding: FileSystem.EncodingType.Base64 });
+        } else {
+          await FileSystem.copyAsync({ from: asset.uri, to: destUri });
+        }
+        setProfileImageUri(destUri);
+        await SecureStore.setItemAsync(PROFILE_IMAGE_KEY, destUri);
+      } catch {
+        // Last resort: use picker URI for this session (won't survive restart)
+        setProfileImageUri(asset.uri);
+      }
     }
   };
 
