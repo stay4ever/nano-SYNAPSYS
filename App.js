@@ -135,8 +135,13 @@ function makeRawStyles(C) {
       fontFamily: mono, fontSize: 16, fontWeight: '700',
       color: C.bright, letterSpacing: 1, textAlign: 'center',
     },
-    backBtn:     { paddingVertical: 4, paddingRight: 8 },
-    backBtnText: { fontFamily: mono, fontSize: 13, color: C.accent },
+    backBtnCircle: {
+      width: 34, height: 34, borderRadius: 17,
+      backgroundColor: 'rgba(0,255,65,0.09)',
+      justifyContent: 'center', alignItems: 'center',
+      marginLeft: 4,
+    },
+    backBtnChevron: { fontFamily: mono, fontSize: 22, color: C.accent, lineHeight: 26, marginTop: -1 },
 
     homeHeader: {
       backgroundColor: C.surface,
@@ -1109,18 +1114,26 @@ function OnlineDot({ online }) {
 
 function AppHeader({ title, onBack, rightComponent }) {
   const { styles } = useSkin();
+  const slideIn = useRef(new Animated.Value(-20)).current;
+  const fadeIn  = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(slideIn, { toValue: 0, duration: 260, useNativeDriver: true }),
+      Animated.timing(fadeIn,  { toValue: 1, duration: 260, useNativeDriver: true }),
+    ]).start();
+  }, []);
   return (
-    <View style={styles.appHeader}>
+    <Animated.View style={[styles.appHeader, { opacity: fadeIn, transform: [{ translateX: slideIn }] }]}>
       {onBack ? (
-        <TouchableOpacity onPress={onBack} style={styles.backBtn}>
-          <Text style={styles.backBtnText}>{'< BACK'}</Text>
+        <TouchableOpacity onPress={onBack} style={styles.backBtnCircle} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+          <Text style={styles.backBtnChevron}>{'‹'}</Text>
         </TouchableOpacity>
       ) : (
-        <View style={{ width: 80 }} />
+        <View style={{ width: 42 }} />
       )}
       <Text style={styles.appHeaderTitle}>{title}</Text>
-      {rightComponent ? rightComponent : <View style={{ width: 80 }} />}
-    </View>
+      {rightComponent ? rightComponent : <View style={{ width: 42 }} />}
+    </Animated.View>
   );
 }
 
@@ -1624,7 +1637,8 @@ function BiometricUnlockScreen({ onUnlock, onUsePassword }) {
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <View style={styles.centerFill}>
         <Image source={require('./assets/icon.png')} style={{ width: 96, height: 96, borderRadius: 22, marginBottom: 10 }} resizeMode="contain" />
-        <Text style={styles.logoSub}>AI EVOLUTION SECURE MESH</Text>
+        <Text style={[styles.logoText, { fontSize: 18, letterSpacing: 3 }]}>nano-SYNAPSYS</Text>
+        <Text style={styles.logoSub}>BY AI EVOLUTION</Text>
         <View style={{ height: 48 }} />
         <TouchableOpacity onPress={() => tryBiometric(false)} disabled={loading} activeOpacity={0.7}>
           <VaultIcon size={72} />
@@ -1651,6 +1665,10 @@ function BiometricUnlockScreen({ onUnlock, onUsePassword }) {
 function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
   const { styles, C } = useSkin();
   const mono = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
+  const logoScale = useRef(new Animated.Value(1)).current;
+  const animateLogo = (small) => Animated.timing(logoScale, {
+    toValue: small ? 0.62 : 1, duration: 240, useNativeDriver: true,
+  }).start();
   const [tab, setTab]                 = useState('LOGIN');
   const [username, setUsername]       = useState('');
   const [email, setEmail]             = useState('');
@@ -1772,8 +1790,13 @@ function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
       <KeyboardAvoidingView style={styles.flex} behavior={KAV_BEHAVIOR}>
         <ScrollView contentContainerStyle={styles.authScroll} keyboardShouldPersistTaps="handled">
           <View style={styles.logoBlock}>
-            <Image source={require('./assets/icon.png')} style={{ width: 96, height: 96, borderRadius: 22, marginBottom: 10 }} resizeMode="contain" />
-            <Text style={styles.logoSub}>AI EVOLUTION SECURE MESH</Text>
+            <Animated.Image
+              source={require('./assets/icon.png')}
+              style={{ width: 96, height: 96, borderRadius: 22, marginBottom: 10, transform: [{ scale: logoScale }] }}
+              resizeMode="contain"
+            />
+            <Text style={[styles.logoText, { fontSize: 18, letterSpacing: 3 }]}>nano-SYNAPSYS</Text>
+            <Text style={styles.logoSub}>BY AI EVOLUTION</Text>
           </View>
 
           {/* Invite banner — shown when user arrives via nanosynapsys://join/TOKEN */}
@@ -1807,13 +1830,16 @@ function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
               value={username} onChangeText={setUsername}
               autoCapitalize="none" autoCorrect={false}
               keyboardType={tab === 'LOGIN' ? 'email-address' : 'default'}
+              onFocus={() => animateLogo(true)} onBlur={() => animateLogo(false)}
             />
             {tab === 'REGISTER' && (
               <TextInput style={styles.input} placeholder="EMAIL" placeholderTextColor={C.muted}
-                value={email} onChangeText={setEmail} autoCapitalize="none" keyboardType="email-address" autoCorrect={false} />
+                value={email} onChangeText={setEmail} autoCapitalize="none" keyboardType="email-address" autoCorrect={false}
+                onFocus={() => animateLogo(true)} onBlur={() => animateLogo(false)} />
             )}
             <TextInput style={styles.input} placeholder="PASSWORD" placeholderTextColor={C.muted}
-              value={password} onChangeText={setPassword} secureTextEntry />
+              value={password} onChangeText={setPassword} secureTextEntry
+              onFocus={() => animateLogo(true)} onBlur={() => animateLogo(false)} />
             <ErrText msg={err} />
             <TouchableOpacity style={[styles.primaryBtn, loading && styles.primaryBtnDisabled]}
               onPress={tab === 'LOGIN' ? handleLogin : handleRegister} disabled={loading}>
@@ -1900,10 +1926,9 @@ function SwipeableRow({ children, rightLabel = 'DELETE', rightColor, onAction, d
   R.current.snapTo = (toValue) => {
     Animated.spring(position, {
       toValue,
-      useNativeDriver: true,
-      tension: 80,
-      friction: 12,
-      overshootClamping: true,
+      useNativeDriver: false,   // keep on JS thread to match setValue tracking
+      bounciness: 0,
+      speed: 28,
     }).start();
   };
 
@@ -1913,8 +1938,8 @@ function SwipeableRow({ children, rightLabel = 'DELETE', rightColor, onAction, d
     fired.current = true;
     Animated.timing(position, {
       toValue: -500,
-      duration: 220,
-      useNativeDriver: true,
+      duration: 200,
+      useNativeDriver: false,
     }).start(() => R.current.onAction && R.current.onAction());
   };
 
@@ -1922,25 +1947,22 @@ function SwipeableRow({ children, rightLabel = 'DELETE', rightColor, onAction, d
     onStartShouldSetPanResponder: () => false,
     // Claim horizontal gestures; let vertical scroll through unimpeded
     onMoveShouldSetPanResponder: (_, { dx, dy }) =>
-      !R.current.disabled && Math.abs(dx) > 8 && Math.abs(dx) > Math.abs(dy) * 2,
+      !R.current.disabled && Math.abs(dx) > 4 && Math.abs(dx) > Math.abs(dy) * 1.8,
 
-    onPanResponderGrant: () => {
+    onPanResponderGrant: (_, { x0: _x }) => {
       fired.current = false;
       position.stopAnimation((val) => { dragStart.current = val; });
     },
 
     onPanResponderMove: (_, { dx }) => {
-      // Allow dragging further than _SWIPE_W so a full swipe feels natural
       position.setValue(Math.min(0, dragStart.current + dx));
     },
 
     onPanResponderRelease: (_, { dx, vx }) => {
       const cur = Math.min(0, dragStart.current + dx);
-      if (vx < -0.4 || cur < -_FULL_SWIPE) {
-        // Hard/fast swipe → fly off and fire action immediately
+      if (vx < -0.5 || cur < -_FULL_SWIPE) {
         R.current.slideOff();
-      } else if (vx < -0.15 || cur < -(_SWIPE_W * 0.35)) {
-        // Light swipe → reveal the button (trigger after ~31px drag)
+      } else if (vx < -0.12 || cur < -(_SWIPE_W * 0.3)) {
         R.current.snapTo(-_SWIPE_W);
       } else {
         R.current.snapTo(0);
@@ -2017,6 +2039,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
 
   const [deviceContacts, setDeviceContacts] = useState([]);
   const [contactsLoading, setContactsLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [contactsErr,     setContactsErr]     = useState('');
   const [contactsQuery,   setContactsQuery]   = useState('');
   const [phoneStatuses,   setPhoneStatuses]   = useState({});
@@ -2036,7 +2059,8 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
     else { setContactsQuery(''); setContactsErr(''); }
   }, [visible]);
 
-  const loadAll = async () => {
+  const loadAll = async (isRefresh = false) => {
+    if (isRefresh) setRefreshing(true);
     // Fetch accepted app contacts for green LED check
     try {
       const data = await api('/api/contacts', 'GET', null, token);
@@ -2054,11 +2078,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
       return;
     }
 
-    // iOS 18+ limited access — user chose specific contacts only
-    if (permResult.accessPrivileges === 'limited') {
-      setContactsErr('LIMITED_ACCESS');
-    }
-
+    // iOS 18+ limited access — just show whatever contacts are available, no banner
     setContactsLoading(true);
     try {
       const result = await Contacts.getContactsAsync({
@@ -2086,6 +2106,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
       setContactsErr('Could not load contacts: ' + (e?.message || String(e)));
     } finally {
       setContactsLoading(false);
+      setRefreshing(false);
     }
   };
 
@@ -2249,7 +2270,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
           {/* Body */}
           {contactsLoading ? (
             <View style={{ paddingVertical: 40, alignItems: 'center' }}><Spinner size="large" /></View>
-          ) : contactsErr && contactsErr !== 'LIMITED_ACCESS' ? (
+          ) : contactsErr ? (
             <View style={{ padding: 24, alignItems: 'center', gap: 14 }}>
               <Text style={{ fontFamily: mono, fontSize: 11, color: C.red, textAlign: 'center', letterSpacing: 1 }}>
                 CONTACTS PERMISSION DENIED
@@ -2266,24 +2287,12 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
             </View>
           ) : (
             <>
-              {contactsErr === 'LIMITED_ACCESS' && (
-                <TouchableOpacity
-                  onPress={async () => {
-                    try { await Contacts.presentAccessPickerAsync(); await loadAll(); } catch {}
-                  }}
-                  style={{ flexDirection: 'row', alignItems: 'center', marginHorizontal: 16, marginBottom: 8, padding: 10, borderRadius: 6, borderWidth: 1, borderColor: C.amber, gap: 8 }}
-                >
-                  <Text style={{ fontFamily: mono, fontSize: 10, color: C.amber, flex: 1, lineHeight: 15 }}>
-                    {'LIMITED ACCESS — only selected contacts visible.\nTap to expand access.'}
-                  </Text>
-                  <Text style={{ fontFamily: mono, fontSize: 9, color: C.amber }}>EXPAND ›</Text>
-                </TouchableOpacity>
-              )}
             <FlatList
               data={filtered}
               keyExtractor={c => c.id}
               style={{ flex: 1 }}
               keyboardShouldPersistTaps="handled"
+              refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => loadAll(true)} tintColor={C.accent} />}
               ListEmptyComponent={<Text style={styles.emptyText}>NO CONTACTS FOUND</Text>}
               ListHeaderComponent={deviceContacts.length > 0 ? (
                 <Text style={{ fontFamily: mono, fontSize: 9, color: C.dim, paddingHorizontal: 16, paddingTop: 2, paddingBottom: 6 }}>
@@ -4322,7 +4331,7 @@ function SettingsTab({ token, currentUser, notifEnabled, onSetNotifEnabled }) {
       </View>
       <View style={styles.profileCard}>
         <Text style={styles.profileLabel}>NETWORK</Text>
-        <Text style={styles.profileValue}>AI EVOLUTION SECURE MESH</Text>
+        <Text style={styles.profileValue}>BY AI EVOLUTION</Text>
       </View>
       <View style={styles.profileCard}>
         <Text style={styles.profileLabel}>ENCRYPTION</Text>
