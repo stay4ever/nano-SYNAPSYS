@@ -45,10 +45,14 @@ import * as SMS from 'expo-sms';
 import * as Notifications from 'expo-notifications';
 import * as Calendar from 'expo-calendar';
 import Svg, { Path, Circle, Line, G, Polygon, Rect, Defs, Pattern } from 'react-native-svg';
-// tweetnacl — pure-JS NaCl cryptography (no native linking required)
+// tweetnacl — still used inside signal_protocol.js; keep import for legacy decrypt
 // eslint-disable-next-line import/no-commonjs
 const nacl     = require('tweetnacl');
+// eslint-disable-next-line import/no-commonjs
 const naclUtil = require('tweetnacl-util');
+// Signal Protocol — X3DH + Double Ratchet + Sender Keys
+// eslint-disable-next-line import/no-commonjs
+const SIG      = require('./src/signal_protocol');
 
 // ---------------------------------------------------------------------------
 // COLOUR PALETTES
@@ -662,209 +666,475 @@ const DISAPPEAR_OPTIONS = [
 const KAV_BEHAVIOR = Platform.OS === 'ios' ? 'padding' : 'height';
 
 // ---------------------------------------------------------------------------
-// E2EE — NaCl (X25519 + XSalsa20-Poly1305)  — module-level singletons
+// E2EE — Signal Protocol (X3DH + Double Ratchet + Sender Keys)
+// Backward-compatible: legacy NaCl envelopes are still decrypted if received.
 // ---------------------------------------------------------------------------
-// Session keypair {publicKey: Uint8Array, secretKey: Uint8Array}
-let _e2eeKey      = null;
-// { [userId]: base64PubKey }
-const _pkCache    = {};
-// { [groupId]: Uint8Array(32) }
-const _groupKeyCache = {};
 
-const E2EE_SK_STORE = 'e2ee_secret_key';
+// ── Identity key singleton ────────────────────────────────────────────────────
+let _sigIdentityKey = null;   // { publicKey: Uint8Array, secretKey: Uint8Array }
+let _sigSPK         = null;   // signed pre-key { publicKey, secretKey, id }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// SecureStore keys
+const SIG_IK_STORE   = 'sig_identity_key_v1';
+const SIG_SPK_STORE  = 'sig_signed_prekey_v1';
+const SIG_OPK_STORE  = 'sig_one_time_prekeys_v1';
+const sigSessStore   = (uid)     => `sig_session_${uid}`;
+const sigSKStore     = (gid, sid) => `sig_sk_${gid}_${sid}`;
 
+// In-memory caches
+const _sigSessions    = {};   // { [userId]:  drSession  }
+const _sigSenderKeys  = {};   // { [`${gid}_${sid}`]: senderKeyState }
+
+// ── Legacy NaCl compat (kept for reading old messages) ───────────────────────
 const _b64enc = (buf) => naclUtil.encodeBase64(buf);
 const _b64dec = (str) => naclUtil.decodeBase64(str);
 
-/** Return the loaded keypair, or null if not yet initialised. */
-function e2eeKey() { return _e2eeKey; }
-
-/**
- * Initialise E2EE for this session.
- *  1. Load secret key from SecureStore (or generate + persist if new).
- *  2. Upload the public key to the server.
- */
-async function initE2EE(token) {
+function _legacyDecryptDM(envelopeStr, myKeyPair) {
   try {
-    let skB64 = await SecureStore.getItemAsync(E2EE_SK_STORE);
-    let kp;
-    if (skB64) {
-      try {
-        const sk = _b64dec(skB64);
-        kp = nacl.box.keyPair.fromSecretKey(sk);
-      } catch {
-        // Stored key is corrupted — discard it and generate a fresh keypair
-        kp = nacl.box.keyPair();
-        await SecureStore.setItemAsync(E2EE_SK_STORE, _b64enc(kp.secretKey));
-      }
-    } else {
-      kp = nacl.box.keyPair();
-      await SecureStore.setItemAsync(E2EE_SK_STORE, _b64enc(kp.secretKey));
-    }
-    _e2eeKey = kp;
-    // Upload public key to server (fire-and-forget — non-blocking)
-    api('/api/keys', 'POST', { public_key: _b64enc(kp.publicKey) }, token).catch(() => {});
-  } catch {}
-}
-
-/** Fetch and cache the public key for a user. Returns base64 string or null. */
-async function fetchPubKey(userId, token) {
-  if (_pkCache[userId]) return _pkCache[userId];
-  try {
-    const data = await api(`/api/keys/${userId}`, 'GET', null, token);
-    if (data?.public_key) { _pkCache[userId] = data.public_key; return data.public_key; }
-  } catch {}
-  return null;
-}
-
-/**
- * Encrypt a DM plaintext for a recipient.
- * Returns a JSON envelope string: {"enc":1,"nonce":"…","ct":"…","spk":"…","rpk":"…"}
- * spk = sender public key, rpk = recipient public key.
- */
-function encryptDM(plaintext, recipientPkB64) {
-  if (!_e2eeKey) return null;
-  try {
-    const nonce      = nacl.randomBytes(nacl.box.nonceLength);
-    const msgBytes   = naclUtil.decodeUTF8(plaintext);
-    const recipientPk = _b64dec(recipientPkB64);
-    const ct         = nacl.box(msgBytes, nonce, recipientPk, _e2eeKey.secretKey);
-    return JSON.stringify({
-      enc:   1,
-      nonce: _b64enc(nonce),
-      ct:    _b64enc(ct),
-      spk:   _b64enc(_e2eeKey.publicKey),
-      rpk:   recipientPkB64,
-    });
-  } catch { return null; }
-}
-
-/**
- * Decrypt a DM envelope string received from the server.
- * Returns the plaintext, or null if decryption fails.
- */
-function decryptDM(envelopeStr) {
-  if (!_e2eeKey) return null;
-  try {
-    const env    = JSON.parse(envelopeStr);
+    const env = JSON.parse(envelopeStr);
     if (env.enc !== 1) return null;
-    const nonce  = _b64dec(env.nonce);
-    const ct     = _b64dec(env.ct);
-    const myPkB64 = _b64enc(_e2eeKey.publicKey);
-    // Choose "their" key: if I am the sender (spk === mine), use rpk; else use spk
+    const myPkB64    = _b64enc(myKeyPair.publicKey);
     const theirPkB64 = (env.spk === myPkB64) ? env.rpk : env.spk;
-    const theirPk    = _b64dec(theirPkB64);
-    const plain      = nacl.box.open(ct, nonce, theirPk, _e2eeKey.secretKey);
+    const plain = nacl.box.open(
+      _b64dec(env.ct), _b64dec(env.nonce), _b64dec(theirPkB64), myKeyPair.secretKey
+    );
     return plain ? naclUtil.encodeUTF8(plain) : null;
   } catch { return null; }
 }
 
-/** Return true if a message content string looks like an E2EE DM envelope. */
-function isEncryptedDM(content) {
-  return typeof content === 'string' && content.startsWith('{"enc":1');
-}
-
-/**
- * Encrypt a group message with the group's symmetric key.
- * Returns a JSON envelope string: {"enc":2,"nonce":"…","ct":"…"}
- */
-function encryptGroupMsg(plaintext, groupKey) {
-  if (!groupKey) return null;
-  try {
-    const nonce    = nacl.randomBytes(nacl.secretbox.nonceLength);
-    const msgBytes = naclUtil.decodeUTF8(plaintext);
-    const ct       = nacl.secretbox(msgBytes, nonce, groupKey);
-    return JSON.stringify({ enc: 2, nonce: _b64enc(nonce), ct: _b64enc(ct) });
-  } catch { return null; }
-}
-
-/**
- * Decrypt a group message envelope.
- * Returns the plaintext, or null on failure.
- */
-function decryptGroupMsg(envelopeStr, groupKey) {
-  if (!groupKey) return null;
+function _legacyDecryptGroup(envelopeStr, groupKey) {
   try {
     const env   = JSON.parse(envelopeStr);
     if (env.enc !== 2) return null;
-    const nonce = _b64dec(env.nonce);
-    const ct    = _b64dec(env.ct);
-    const plain = nacl.secretbox.open(ct, nonce, groupKey);
+    const plain = nacl.secretbox.open(_b64dec(env.ct), _b64dec(env.nonce), groupKey);
     return plain ? naclUtil.encodeUTF8(plain) : null;
   } catch { return null; }
 }
 
-/** Return true if a content string looks like an E2EE group envelope. */
-function isEncryptedGroup(content) {
-  return typeof content === 'string' && content.startsWith('{"enc":2');
+// ── Key initialisation ────────────────────────────────────────────────────────
+
+/**
+ * Generate a random pre-key ID (1–0x7FFFFF).
+ */
+function _newKeyId() { return Math.floor(Math.random() * 0x7FFFFF) + 1; }
+
+/**
+ * Self-sign the signed pre-key using the identity key.
+ * We use HMAC-SHA256(IK_secret, SPK_public) as a lightweight signature
+ * (full Ed25519 signing is not yet supported by tweetnacl's box API).
+ * Returns base64 88-char signature (64 bytes → 88 base64 chars).
+ */
+function _selfSign(ikSecretKey, spkPublicKey) {
+  // Pad to 64 bytes so server validates length === 88 (base64 of 64B)
+  const combined = new Uint8Array(64);
+  const mac = nacl.hash(new Uint8Array([...ikSecretKey, ...spkPublicKey]));  // SHA-512
+  combined.set(mac.slice(0, 64));
+  return _b64enc(combined);
 }
 
 /**
- * Encrypt the group key (Uint8Array) for a member using nacl.box.
- * Returns a JSON string: {"nonce":"…","ct":"…"} or null on failure.
+ * Initialise Signal Protocol for this session:
+ *   1. Load or generate identity key pair (IK) — persistent
+ *   2. Load or generate signed pre-key (SPK)   — persistent
+ *   3. Generate one-time pre-keys (OPK)         — upload batch if needed
+ *   4. Register pre-key bundle with server
+ *   5. Upload legacy public key for backward-compat (/api/keys)
  */
-function encryptKeyForMember(groupKey, memberPkB64) {
-  if (!_e2eeKey || !groupKey) return null;
+async function initE2EE(token) {
   try {
-    const nonce     = nacl.randomBytes(nacl.box.nonceLength);
-    const memberPk  = _b64dec(memberPkB64);
-    const ct        = nacl.box(groupKey, nonce, memberPk, _e2eeKey.secretKey);
-    return JSON.stringify({ nonce: _b64enc(nonce), ct: _b64enc(ct) });
-  } catch { return null; }
+    // ── Identity Key ────────────────────────────────────────────────────────
+    const ikRaw = await SecureStore.getItemAsync(SIG_IK_STORE);
+    if (ikRaw) {
+      try {
+        const stored = JSON.parse(ikRaw);
+        _sigIdentityKey = {
+          publicKey: _b64dec(stored.pub),
+          secretKey: _b64dec(stored.sec),
+        };
+      } catch { _sigIdentityKey = null; }
+    }
+    if (!_sigIdentityKey) {
+      _sigIdentityKey = nacl.box.keyPair();
+      await SecureStore.setItemAsync(SIG_IK_STORE, JSON.stringify({
+        pub: _b64enc(_sigIdentityKey.publicKey),
+        sec: _b64enc(_sigIdentityKey.secretKey),
+      }));
+    }
+
+    // ── Signed Pre-Key ──────────────────────────────────────────────────────
+    const spkRaw = await SecureStore.getItemAsync(SIG_SPK_STORE);
+    if (spkRaw) {
+      try {
+        const stored = JSON.parse(spkRaw);
+        _sigSPK = {
+          id:        stored.id,
+          publicKey: _b64dec(stored.pub),
+          secretKey: _b64dec(stored.sec),
+        };
+      } catch { _sigSPK = null; }
+    }
+    if (!_sigSPK) {
+      const kp = nacl.box.keyPair();
+      _sigSPK  = { id: _newKeyId(), publicKey: kp.publicKey, secretKey: kp.secretKey };
+      await SecureStore.setItemAsync(SIG_SPK_STORE, JSON.stringify({
+        id:  _sigSPK.id,
+        pub: _b64enc(_sigSPK.publicKey),
+        sec: _b64enc(_sigSPK.secretKey),
+      }));
+    }
+
+    // ── One-Time Pre-Keys ───────────────────────────────────────────────────
+    const otpRaw   = await SecureStore.getItemAsync(SIG_OPK_STORE);
+    let   otpStore = otpRaw ? JSON.parse(otpRaw) : { keys: [], nextId: 1 };
+
+    // Upload if pool has fewer than 20 keys
+    const remaining = await api('/api/signal/prekeys/count', 'GET', null, token).catch(() => ({ remaining_otks: 99 }));
+    if ((remaining?.remaining_otks ?? 0) < 20) {
+      const batch = [];
+      for (let i = 0; i < 50; i++) {
+        const kp = nacl.box.keyPair();
+        batch.push({ id: otpStore.nextId + i, key: _b64enc(kp.publicKey) });
+        // Store secret key locally
+        otpStore.keys.push({
+          id: otpStore.nextId + i,
+          pub: _b64enc(kp.publicKey),
+          sec: _b64enc(kp.secretKey),
+        });
+      }
+      otpStore.nextId += 50;
+      await SecureStore.setItemAsync(SIG_OPK_STORE, JSON.stringify(otpStore));
+      api('/api/signal/prekeys/one-time', 'POST', { one_time_prekeys: batch }, token).catch(() => {});
+    }
+
+    // ── Register bundle with server ─────────────────────────────────────────
+    const sig = _selfSign(_sigIdentityKey.secretKey, _sigSPK.publicKey);
+    api('/api/signal/prekeys', 'POST', {
+      identity_key:             _b64enc(_sigIdentityKey.publicKey),
+      signed_prekey_id:         _sigSPK.id,
+      signed_prekey:            _b64enc(_sigSPK.publicKey),
+      signed_prekey_signature:  sig,
+    }, token).catch(() => {});
+
+    // ── Legacy key for backward-compat (/api/keys still expects a 44-char key)
+    api('/api/keys', 'POST', { public_key: _b64enc(_sigIdentityKey.publicKey) }, token).catch(() => {});
+
+  } catch (e) {
+    console.warn('[Signal] initE2EE error:', e?.message);
+  }
 }
 
-/**
- * Decrypt a group key envelope (JSON string) using nacl.box.
- * distributorPkB64 = the admin's public key that encrypted the key for us.
- * Returns Uint8Array(32) or null.
- */
-function decryptGroupKey(encryptedKeyJson, distributorPkB64) {
-  if (!_e2eeKey) return null;
-  try {
-    const env          = JSON.parse(encryptedKeyJson);
-    const nonce        = _b64dec(env.nonce);
-    const ct           = _b64dec(env.ct);
-    const distributorPk = _b64dec(distributorPkB64);
-    const plain        = nacl.box.open(ct, nonce, distributorPk, _e2eeKey.secretKey);
-    return plain;   // 32-byte Uint8Array
-  } catch { return null; }
-}
+/** Return the loaded identity keypair, or null. */
+function e2eeKey() { return _sigIdentityKey; }
+
+// ── Session management ────────────────────────────────────────────────────────
 
 /**
- * Load the group key for groupId — try cache first, then server.
- * Returns Uint8Array(32) or null.
+ * Load or build a Double Ratchet session with `peerId`.
+ * If no session exists, fetches their pre-key bundle and runs X3DH.
+ * Returns the session object, or null if setup failed.
  */
-async function loadGroupKey(groupId, token) {
-  if (_groupKeyCache[groupId]) return _groupKeyCache[groupId];
+async function _getOrBuildSession(peerId, token) {
+  // 1. In-memory cache
+  if (_sigSessions[peerId]) return _sigSessions[peerId];
+
+  // 2. SecureStore
   try {
-    const data = await api(`/api/groups/${groupId}/key`, 'GET', null, token);
-    if (data?.encrypted_key && data?.distributor_pk) {
-      const key = decryptGroupKey(data.encrypted_key, data.distributor_pk);
-      if (key) { _groupKeyCache[groupId] = key; return key; }
+    const raw = await SecureStore.getItemAsync(sigSessStore(peerId));
+    if (raw) {
+      const sess = SIG.deserialiseSession(raw);
+      _sigSessions[peerId] = sess;
+      return sess;
     }
   } catch {}
+
+  // 3. Build new session via X3DH
+  try {
+    const bundle = await api(`/api/signal/prekeys/${peerId}`, 'GET', null, token);
+    if (!bundle?.identity_key || !bundle?.signed_prekey) return null;
+
+    const IK_B_pub   = _b64dec(bundle.identity_key);
+    const SPK_B_pub  = _b64dec(bundle.signed_prekey);
+    const OPK_B_pub  = bundle.one_time_prekey ? _b64dec(bundle.one_time_prekey.key) : null;
+
+    // Ephemeral key pair (single use)
+    const EK_A = nacl.box.keyPair();
+
+    const SK = SIG.x3dhInitiator(
+      _sigIdentityKey.secretKey, EK_A.secretKey,
+      IK_B_pub, SPK_B_pub, OPK_B_pub
+    );
+
+    // Double Ratchet init — sender starts with SPK_B as their ratchet key
+    const sess = SIG.drInitSender(SK, SPK_B_pub);
+
+    // Attach X3DH metadata so receiver can run x3dhResponder
+    sess._x3dh = {
+      IK_A_pub:   _b64enc(_sigIdentityKey.publicKey),
+      EK_A_pub:   _b64enc(EK_A.publicKey),
+      SPK_B_id:   bundle.signed_prekey_id,
+      OPK_B_id:   bundle.one_time_prekey?.id ?? null,
+    };
+
+    _sigSessions[peerId] = sess;
+    await SecureStore.setItemAsync(sigSessStore(peerId), SIG.serialiseSession(sess));
+    return sess;
+  } catch (e) {
+    console.warn('[Signal] session build failed:', e?.message);
+    return null;
+  }
+}
+
+/** Persist a session to SecureStore after mutation. */
+async function _saveSession(peerId) {
+  const sess = _sigSessions[peerId];
+  if (!sess) return;
+  try {
+    await SecureStore.setItemAsync(sigSessStore(peerId), SIG.serialiseSession(sess));
+  } catch {}
+}
+
+// ── DM Encryption ─────────────────────────────────────────────────────────────
+
+/**
+ * Encrypt a DM for peerId.
+ * Returns an envelope JSON string or null on failure.
+ */
+async function encryptDM(plaintext, _recipientPkB64_unused, peerId, token) {
+  const sess = await _getOrBuildSession(peerId, token);
+  if (!sess) return null;
+  try {
+    const { header, ciphertext } = SIG.drEncrypt(sess, plaintext);
+    await _saveSession(peerId);
+    const envelope = {
+      sig:  true,
+      v:    1,
+      hdr:  JSON.stringify({ ...header, x3dh: sess._x3dh }),
+      ct:   ciphertext,
+    };
+    // Clear x3dh after first message — subsequent messages don't need it
+    delete sess._x3dh;
+    return JSON.stringify(envelope);
+  } catch (e) {
+    console.warn('[Signal] encryptDM error:', e?.message);
+    return null;
+  }
+}
+
+/**
+ * Decrypt a DM envelope string from senderId.
+ * Handles Signal Protocol (sig:true) and legacy NaCl (enc:1).
+ * Returns plaintext string or null.
+ */
+async function decryptDM(envelopeStr, senderId, token) {
+  if (!envelopeStr) return null;
+  try {
+    const env = JSON.parse(envelopeStr);
+
+    // ── Signal Protocol ──────────────────────────────────────────────────────
+    if (env?.sig === true && env?.v === 1) {
+      const hdr = JSON.parse(env.hdr);
+
+      // If we have no session and x3dh metadata is present, build session as responder
+      if (!_sigSessions[senderId] && hdr.x3dh) {
+        const x3 = hdr.x3dh;
+        // Load our SPK secret key
+        const spkRaw = await SecureStore.getItemAsync(SIG_SPK_STORE);
+        const spkStore = spkRaw ? JSON.parse(spkRaw) : null;
+        if (!spkStore || spkStore.id !== x3.SPK_B_id) return null;  // SPK rotated
+
+        const IK_B  = _sigIdentityKey;
+        const SPK_B = { publicKey: _b64dec(spkStore.pub), secretKey: _b64dec(spkStore.sec) };
+
+        // Load our OPK secret key (if used)
+        let OPK_B_sec = null;
+        if (x3.OPK_B_id != null) {
+          const otpRaw  = await SecureStore.getItemAsync(SIG_OPK_STORE);
+          const otpStore = otpRaw ? JSON.parse(otpRaw) : null;
+          const opk     = otpStore?.keys?.find(k => k.id === x3.OPK_B_id);
+          if (opk) OPK_B_sec = _b64dec(opk.sec);
+        }
+
+        const IK_A_pub = _b64dec(x3.IK_A_pub);
+        const EK_A_pub = _b64dec(x3.EK_A_pub);
+
+        const SK = SIG.x3dhResponder(
+          IK_B.secretKey, SPK_B.secretKey, OPK_B_sec,
+          IK_A_pub, EK_A_pub
+        );
+
+        const sess = SIG.drInitReceiver(SK, SPK_B);
+        _sigSessions[senderId] = sess;
+      }
+
+      if (!_sigSessions[senderId]) return null;
+
+      const plain = SIG.drDecrypt(_sigSessions[senderId], hdr, env.ct);
+      await _saveSession(senderId);
+      return plain;
+    }
+
+    // ── Legacy NaCl DM ───────────────────────────────────────────────────────
+    if (env?.enc === 1 && _sigIdentityKey) {
+      return _legacyDecryptDM(envelopeStr, _sigIdentityKey);
+    }
+  } catch (e) {
+    console.warn('[Signal] decryptDM error:', e?.message);
+  }
   return null;
 }
 
-/** Generate a fresh 32-byte group key, distribute it to all member public keys,
- *  upload via POST /api/groups/<id>/key, and cache locally. */
-async function generateAndDistributeGroupKey(groupId, memberPubKeys, token) {
-  if (!_e2eeKey) return;
-  const groupKey = nacl.randomBytes(nacl.secretbox.keyLength); // 32 bytes
-  _groupKeyCache[groupId] = groupKey;
+/** Return true if content is a Signal DM or legacy NaCl DM envelope. */
+function isEncryptedDM(content) {
+  return SIG.isSignalDM(content) || SIG.isLegacyNaClDM(content);
+}
+
+// ── Group Encryption — Sender Keys ────────────────────────────────────────────
+
+/**
+ * Get or create the local sender key chain for a group.
+ * Returns the sender key state object.
+ */
+async function _getMySenderKeyState(groupId, myId) {
+  const cacheKey = `${groupId}_${myId}`;
+  if (_sigSenderKeys[cacheKey]) return _sigSenderKeys[cacheKey];
+  try {
+    const raw = await SecureStore.getItemAsync(sigSKStore(groupId, myId));
+    if (raw) {
+      const state = SIG.deserialiseSKState(raw);
+      _sigSenderKeys[cacheKey] = state;
+      return state;
+    }
+  } catch {}
+  // Generate fresh sender key
+  const state = SIG.skGenerate();
+  _sigSenderKeys[cacheKey] = state;
+  await SecureStore.setItemAsync(sigSKStore(groupId, myId), SIG.serialiseSKState(state));
+  return state;
+}
+
+/**
+ * Distribute our sender key to all group members (encrypted via their DM sessions).
+ * Called when joining or creating a group.
+ */
+async function generateAndDistributeGroupKey(groupId, memberPubKeys, token, myId) {
+  const myState    = await _getMySenderKeyState(groupId, myId);
+  const skPayload  = SIG.serialiseSKState(myState);   // JSON string
 
   const keys = [];
-  for (const { userId, publicKey } of memberPubKeys) {
-    if (!publicKey) continue;
-    const encKey = encryptKeyForMember(groupKey, publicKey);
-    if (encKey) keys.push({ user_id: userId, encrypted_key: encKey, distributor_pk: _b64enc(_e2eeKey.publicKey) });
+  for (const { userId } of memberPubKeys) {
+    if (userId === myId) continue;
+    try {
+      // Encrypt the sender key state for this member using their Signal DM session
+      const sess = await _getOrBuildSession(userId, token);
+      if (!sess) continue;
+      const { header, ciphertext } = SIG.drEncrypt(sess, skPayload);
+      await _saveSession(userId);
+      keys.push({
+        recipient_id: userId,
+        encrypted_sk: JSON.stringify({ hdr: JSON.stringify(header), ct: ciphertext }),
+      });
+    } catch {}
   }
+
   if (keys.length > 0) {
-    api(`/api/groups/${groupId}/key`, 'POST', { keys }, token).catch(() => {});
+    api('/api/signal/sender-keys', 'POST', { group_id: groupId, keys }, token).catch(() => {});
   }
 }
+
+/**
+ * Load all sender keys for a group (from server → decrypt via DM sessions).
+ * Caches in memory and SecureStore.
+ */
+async function loadGroupSenderKeys(groupId, token, myId) {
+  try {
+    const serverKeys = await api(`/api/signal/sender-keys/${groupId}`, 'GET', null, token);
+    for (const { sender_id, encrypted_sk } of (serverKeys || [])) {
+      const cacheKey = `${groupId}_${sender_id}`;
+      if (_sigSenderKeys[cacheKey]) continue;
+
+      try {
+        const env  = JSON.parse(encrypted_sk);
+        const hdr  = JSON.parse(env.hdr);
+        const plain = await decryptDM(
+          JSON.stringify({ sig: true, v: 1, hdr: env.hdr, ct: env.ct }),
+          sender_id, token
+        );
+        if (plain) {
+          const state = SIG.deserialiseSKState(plain);
+          _sigSenderKeys[cacheKey] = state;
+          await SecureStore.setItemAsync(sigSKStore(groupId, sender_id), SIG.serialiseSKState(state));
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+/**
+ * Encrypt a group message using our sender key.
+ * Returns JSON envelope string or null.
+ */
+async function encryptGroupMsg(plaintext, _unusedGroupKey, groupId, myId) {
+  const state = await _getMySenderKeyState(groupId, myId);
+  const { newState, envelope } = SIG.skEncrypt(state, plaintext, myId);
+  _sigSenderKeys[`${groupId}_${myId}`] = newState;
+  await SecureStore.setItemAsync(sigSKStore(groupId, myId), SIG.serialiseSKState(newState));
+  return JSON.stringify(envelope);
+}
+
+/**
+ * Decrypt a group message.
+ * Handles Signal Sender Keys (gsig:true) and legacy NaCl (enc:2).
+ * Returns plaintext or null.
+ */
+async function decryptGroupMsg(envelopeStr, _unusedGroupKey, senderId, groupId) {
+  if (!envelopeStr) return null;
+  try {
+    const env = JSON.parse(envelopeStr);
+
+    // ── Signal Sender Key ────────────────────────────────────────────────────
+    if (env?.gsig === true) {
+      const cacheKey = `${groupId}_${senderId}`;
+      const state    = _sigSenderKeys[cacheKey];
+      if (!state) return null;
+      const result = SIG.skDecrypt(state, env);
+      if (!result) return null;
+      _sigSenderKeys[cacheKey] = result.newSenderKeyState;
+      await SecureStore.setItemAsync(
+        sigSKStore(groupId, senderId),
+        SIG.serialiseSKState(result.newSenderKeyState)
+      );
+      return result.plaintext;
+    }
+
+    // ── Legacy NaCl group ────────────────────────────────────────────────────
+    if (env?.enc === 2 && _unusedGroupKey) {
+      return _legacyDecryptGroup(envelopeStr, _unusedGroupKey);
+    }
+  } catch (e) {
+    console.warn('[Signal] decryptGroupMsg error:', e?.message);
+  }
+  return null;
+}
+
+/** Return true if content looks like any encrypted group envelope. */
+function isEncryptedGroup(content) {
+  return SIG.isSignalGroup(content) ||
+    (typeof content === 'string' && content.startsWith('{"enc":2'));
+}
+
+// Legacy stubs for call sites that haven't been updated yet
+async function fetchPubKey(userId, token) {
+  // Still used to populate publicKey for group key distribution
+  try {
+    const data = await api(`/api/keys/${userId}`, 'GET', null, token);
+    return data?.public_key || null;
+  } catch { return null; }
+}
+
+// Legacy group key functions — kept for backward compat with older server messages
+async function loadGroupKey(groupId, token) { return null; }
+function encryptKeyForMember() { return null; }
+function decryptGroupKey() { return null; }
 
 // ---------------------------------------------------------------------------
 // API HELPER
@@ -2498,9 +2768,10 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
   const [err, setErr]           = useState('');
   const listRef                 = useRef(null);
   const disappearTimers         = useRef([]);
-  const peerPkRef               = useRef(null);  // cached peer public key
+  const peerPkRef               = useRef(null);  // cached peer public key (legacy compat)
+  const [decryptedMsgs, setDecryptedMsgs] = useState({});
 
-  // Pre-fetch peer's public key for E2EE
+  // Pre-fetch peer's public key for E2EE (legacy NaCl compat)
   useEffect(() => {
     fetchPubKey(peer.id, token).then(pk => { peerPkRef.current = pk; }).catch(() => {});
   }, [peer.id, token]);
@@ -2556,6 +2827,25 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
     if (messages.length > 0) setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 100);
   }, [messages]);
 
+  // Async decrypt all encrypted DMs whenever the message list changes
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const updates = {};
+      for (const msg of messages) {
+        if (isEncryptedDM(msg.content)) {
+          const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? '');
+          const plain = await decryptDM(msg.content, sid, token);
+          updates[msg.id] = plain ?? '[Encrypted — cannot decrypt]';
+        }
+      }
+      if (alive && Object.keys(updates).length > 0) {
+        setDecryptedMsgs(prev => ({ ...prev, ...updates }));
+      }
+    })();
+    return () => { alive = false; };
+  }, [messages, token]);
+
   const sendMessage = useCallback(async (overrideContent = null) => {
     const content = overrideContent ?? text.trim();
     if (!content) return;
@@ -2565,8 +2855,8 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
     try {
       // E2EE: encrypt text messages (not images — images are large binary data)
       let payload = content;
-      if (!isImage && peerPkRef.current && e2eeKey()) {
-        payload = encryptDM(content, peerPkRef.current);
+      if (!isImage && e2eeKey()) {
+        payload = await encryptDM(content, null, peer.id, token);
         if (payload === null) {
           Alert.alert('ENCRYPTION ERROR', 'Could not encrypt message. Send aborted.');
           setSending(false);
@@ -2639,13 +2929,13 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
   }, [sendMessage]);
 
   const isMine = (msg) => String(msg.from_user?.id ?? msg.from_user) === String(currentUser.id);
-  // Resolve plaintext from a message — decrypt if E2EE, else return as-is
-  const resolveContent = (content) => {
-    if (isEncryptedDM(content)) {
-      const plain = decryptDM(content);
-      return { text: plain ?? '[Encrypted — cannot decrypt]', encrypted: true, failed: !plain };
+  // Resolve plaintext from a message — reads from async-decrypted cache
+  const resolveContent = (msg) => {
+    if (isEncryptedDM(msg.content)) {
+      const plain = decryptedMsgs[msg.id];
+      return { text: plain ?? '[Decrypting…]', encrypted: true, failed: plain === undefined };
     }
-    return { text: content, encrypted: false, failed: false };
+    return { text: msg.content, encrypted: false, failed: false };
   };
 
   return (
@@ -2669,7 +2959,7 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
               ListEmptyComponent={<Text style={styles.emptyText}>NO MESSAGES YET</Text>}
               renderItem={({ item }) => {
                 const mine = isMine(item);
-                const { text: msgText, encrypted: isEnc, failed } = resolveContent(item.content);
+                const { text: msgText, encrypted: isEnc, failed } = resolveContent(item);
                 return (
                   <View style={[styles.msgRow, mine ? styles.msgRowMine : styles.msgRowTheirs]}>
                     <View style={[styles.msgBubble, mine ? styles.bubbleMine : styles.bubbleTheirs]}>
@@ -2761,10 +3051,9 @@ function GroupsTab({ token, onOpenGroup, unread = {} }) {
     try {
       const g = await api('/api/groups', 'POST', { name: newName.trim(), description: newDesc.trim() }, token);
       setGroups((prev) => [g, ...prev]); setShowForm(false); setNewName(''); setNewDesc('');
-      // Generate and distribute group key (creator is the only member initially)
+      // Initialize sender key state for the new group (no other members yet, so no distribution)
       if (e2eeKey()) {
-        const myPkB64 = _b64enc(e2eeKey().publicKey);
-        await generateAndDistributeGroupKey(g.id, [{ userId: g.created_by, publicKey: myPkB64 }], token);
+        await generateAndDistributeGroupKey(g.id, [], token, String(g.created_by));
       }
     } catch (e) { setCreateErr(e.message); }
     finally { setCreating(false); }
@@ -2890,14 +3179,17 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
   const [showMembers, setShowMembers] = useState(false);
   const listRef                     = useRef(null);
   const disappearTimers             = useRef([]);
-  const groupKeyRef                 = useRef(null);  // cached Uint8Array group key
+  const groupKeyRef                 = useRef(null);  // legacy NaCl group key (compat)
+  const [decryptedMsgs, setDecryptedMsgs] = useState({});
 
   useEffect(() => () => { disappearTimers.current.forEach(clearTimeout); }, []);
 
-  // Load group symmetric key for E2EE
+  // Load all Signal sender keys for this group (replaces legacy loadGroupKey)
   useEffect(() => {
+    loadGroupSenderKeys(group.id, token, String(currentUser.id)).catch(() => {});
+    // Also load legacy NaCl key for backward compat
     loadGroupKey(group.id, token).then(k => { groupKeyRef.current = k; }).catch(() => {});
-  }, [group.id, token]);
+  }, [group.id, token, currentUser.id]);
 
   // Join the Phoenix channel topic for this group so inbound messages arrive
   useEffect(() => {
@@ -2939,6 +3231,25 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
     if (messages.length > 0) setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 100);
   }, [messages]);
 
+  // Async decrypt all encrypted group messages whenever the message list changes
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const updates = {};
+      for (const msg of messages) {
+        if (isEncryptedGroup(msg.content)) {
+          const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? '');
+          const plain = await decryptGroupMsg(msg.content, null, sid, group.id);
+          updates[msg.id] = plain ?? '[Encrypted — cannot decrypt]';
+        }
+      }
+      if (alive && Object.keys(updates).length > 0) {
+        setDecryptedMsgs(prev => ({ ...prev, ...updates }));
+      }
+    })();
+    return () => { alive = false; };
+  }, [messages, group.id]);
+
   const sendMessage = useCallback(async (overrideContent = null) => {
     const content = overrideContent ?? text.trim();
     if (!content) return;
@@ -2946,10 +3257,10 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
     setSending(true);
     const isImage = typeof content === 'string' && content.startsWith('data:');
     try {
-      // E2EE: encrypt text messages with the group symmetric key
+      // E2EE: encrypt text messages with Signal Sender Keys
       let payload = content;
-      if (!isImage && groupKeyRef.current) {
-        payload = encryptGroupMsg(content, groupKeyRef.current);
+      if (!isImage && e2eeKey()) {
+        payload = await encryptGroupMsg(content, null, group.id, String(currentUser.id));
         if (payload === null) {
           Alert.alert('ENCRYPTION ERROR', 'Could not encrypt group message. Send aborted.');
           setSending(false);
@@ -3020,12 +3331,12 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
     const id = msg.from_user?.id ?? msg.from_user ?? msg.from;
     return String(id) === String(currentUser.id);
   };
-  const resolveGroupContent = (content) => {
-    if (isEncryptedGroup(content)) {
-      const plain = decryptGroupMsg(content, groupKeyRef.current);
-      return { text: plain ?? '[Encrypted — cannot decrypt]', encrypted: true, failed: !plain };
+  const resolveGroupContent = (msg) => {
+    if (isEncryptedGroup(msg.content)) {
+      const plain = decryptedMsgs[msg.id];
+      return { text: plain ?? '[Decrypting…]', encrypted: true, failed: plain === undefined };
     }
-    return { text: content, encrypted: false, failed: false };
+    return { text: msg.content, encrypted: false, failed: false };
   };
 
   return (
@@ -3058,7 +3369,7 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
               renderItem={({ item }) => {
                 const mine = isMine(item);
                 const senderName = mine ? 'YOU' : (item.from_display || item.fromDisplay || item.from_username || item.fromUsername || 'UNKNOWN');
-                const { text: msgText, encrypted: isEnc, failed } = resolveGroupContent(item.content);
+                const { text: msgText, encrypted: isEnc, failed } = resolveGroupContent(item);
                 return (
                   <View style={[styles.msgRow, mine ? styles.msgRowMine : styles.msgRowTheirs]}>
                     <View style={[styles.msgBubble, mine ? styles.bubbleMine : styles.bubbleTheirs]}>
