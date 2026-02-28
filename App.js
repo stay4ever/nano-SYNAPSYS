@@ -2040,6 +2040,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
   const [deviceContacts, setDeviceContacts] = useState([]);
   const [contactsLoading, setContactsLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [isLimited, setIsLimited] = useState(false);
   const [contactsErr,     setContactsErr]     = useState('');
   const [contactsQuery,   setContactsQuery]   = useState('');
   const [phoneStatuses,   setPhoneStatuses]   = useState({});
@@ -2078,7 +2079,8 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
       return;
     }
 
-    // iOS 18+ limited access — just show whatever contacts are available, no banner
+    // iOS 18+: limited access — show available contacts + Settings footer
+    setIsLimited(permResult.accessPrivileges === 'limited');
     setContactsLoading(true);
     try {
       const result = await Contacts.getContactsAsync({
@@ -2179,7 +2181,16 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
   const sendSMSInvite = async (contact) => {
     setInviting(contact.id);
     try {
-      const data = await api('/api/invites', 'POST', {}, token);
+      // Auto-clear invite cap then retry once so it never blocks the user
+      let data;
+      try {
+        data = await api('/api/invites', 'POST', {}, token);
+      } catch (invErr) {
+        if ((invErr.message || '').includes('10 active')) {
+          try { await api('/api/invites', 'DELETE', null, token); } catch {}
+          data = await api('/api/invites', 'POST', {}, token);
+        } else { throw invErr; }
+      }
       const inviteUrl   = data.invite_url || data.url;
       const inviteToken = data.token || null;   // store for server-side cancel
       if (!inviteUrl) { Alert.alert('ERROR', 'Could not generate invite link.'); return; }
@@ -2354,6 +2365,15 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
                   </View>
                 );
               }}
+              ListFooterComponent={isLimited ? (
+                <TouchableOpacity
+                  onPress={() => Linking.openURL('app-settings:')}
+                  style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 14, paddingHorizontal: 16, gap: 6, borderTopWidth: 1, borderTopColor: C.border }}
+                >
+                  <Text style={{ fontFamily: mono, fontSize: 10, color: C.dim, letterSpacing: 0.5 }}>Not seeing all contacts?</Text>
+                  <Text style={{ fontFamily: mono, fontSize: 10, color: C.accent, letterSpacing: 0.5 }}>Open Settings →</Text>
+                </TouchableOpacity>
+              ) : null}
             />
             </>
           )}
@@ -3840,7 +3860,16 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
   const sendSMSInvite = async (contact) => {
     setInviting(contact.id);
     try {
-      const data = await api('/api/invites', 'POST', {}, token);
+      // Auto-clear invite cap then retry once so it never blocks the user
+      let data;
+      try {
+        data = await api('/api/invites', 'POST', {}, token);
+      } catch (invErr) {
+        if ((invErr.message || '').includes('10 active')) {
+          try { await api('/api/invites', 'DELETE', null, token); } catch {}
+          data = await api('/api/invites', 'POST', {}, token);
+        } else { throw invErr; }
+      }
       const inviteUrl = data.invite_url || data.url;
       if (!inviteUrl) {
         Alert.alert('ERROR', 'Could not generate an invite link. Please try again.');
