@@ -628,9 +628,11 @@ const BASE_URL    = 'https://www.ai-evolution.com.au';
 const WS_URL      = 'wss://www.ai-evolution.com.au/chat';
 const JWT_KEY     = 'nano_jwt';
 const USER_KEY    = 'nano_user';
-const BIO_KEY     = 'nano_bio_enabled';
-const BIO_EMAIL_KEY = 'nano_bio_email';
-const BIO_PASS_KEY  = 'nano_bio_pass';
+const BIO_KEY         = 'nano_bio_enabled';
+const BIO_REFRESH_KEY = 'nano_bio_refresh'; // stores refresh token — never passwords
+// Legacy keys kept for cleanup only (no longer written)
+const BIO_EMAIL_KEY   = 'nano_bio_email';
+const BIO_PASS_KEY    = 'nano_bio_pass';
 const SKIN_KEY      = 'nano_skin';
 const DISAPPEAR_KEY = 'nano_disappear';
 const PROFILE_EXT_KEY = 'nano_profile_ext';
@@ -893,17 +895,16 @@ async function saveBioEnabled(v) { await SecureStore.setItemAsync(BIO_KEY, v ? '
 async function loadBioEnabled()  { return (await SecureStore.getItemAsync(BIO_KEY)) === '1'; }
 async function clearBio() {
   await SecureStore.deleteItemAsync(BIO_KEY);
-  await SecureStore.deleteItemAsync(BIO_EMAIL_KEY);
-  await SecureStore.deleteItemAsync(BIO_PASS_KEY);
+  await SecureStore.deleteItemAsync(BIO_REFRESH_KEY);
+  // Also wipe legacy keys if present (migration cleanup)
+  await SecureStore.deleteItemAsync(BIO_EMAIL_KEY).catch(() => {});
+  await SecureStore.deleteItemAsync(BIO_PASS_KEY).catch(() => {});
 }
-async function saveBioCreds(email, password) {
-  await SecureStore.setItemAsync(BIO_EMAIL_KEY, email);
-  await SecureStore.setItemAsync(BIO_PASS_KEY, password);
+async function saveBioRefresh(refreshToken) {
+  await SecureStore.setItemAsync(BIO_REFRESH_KEY, refreshToken);
 }
-async function loadBioCreds() {
-  const email    = await SecureStore.getItemAsync(BIO_EMAIL_KEY);
-  const password = await SecureStore.getItemAsync(BIO_PASS_KEY);
-  return email && password ? { email, password } : null;
+async function loadBioRefresh() {
+  return SecureStore.getItemAsync(BIO_REFRESH_KEY);
 }
 async function isBiometricReady() {
   const hw  = await LocalAuthentication.hasHardwareAsync();
@@ -1666,11 +1667,11 @@ function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
 
   useEffect(() => {
     (async () => {
-      const supported = await isBiometricReady();
-      const enabled   = await loadBioEnabled();
-      const creds     = await loadBioCreds();
+      const supported     = await isBiometricReady();
+      const enabled       = await loadBioEnabled();
+      const refreshToken  = await loadBioRefresh();
       setBioSupported(supported);
-      setBioReady(supported && enabled && !!creds);
+      setBioReady(supported && enabled && !!refreshToken);
     })();
   }, []);
 
@@ -1708,12 +1709,22 @@ function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
         }
         return;
       }
-      const creds = await loadBioCreds();
-      if (!creds) { setErr('No stored credentials. Please log in with password.'); return; }
-      const data = await api('/auth/login', 'POST', { email: creds.email, password: creds.password });
+      const storedRefresh = await loadBioRefresh();
+      if (!storedRefresh) {
+        setErr('Face ID session expired. Log in with password to re-enable Face ID.');
+        await clearBio(); setBioReady(false);
+        return;
+      }
+      const data = await api('/auth/bio-refresh', 'POST', { refresh: storedRefresh });
+      // Rotate: store the new refresh token returned by the server
+      if (data.refresh) await saveBioRefresh(data.refresh);
       await saveToken(data.token); await saveUser(data.user);
       onAuth(data.token, data.user);
-    } catch (e) { setErr(e.message || 'Face ID error. Please try again.'); }
+    } catch (e) {
+      // Refresh token expired or revoked — clear bio so user re-enables with password
+      await clearBio(); setBioReady(false);
+      setErr('Face ID session expired. Please log in with your password and re-enable Face ID in Profile.');
+    }
     finally { setBioLoading(false); }
   };
 
@@ -1723,6 +1734,8 @@ function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
     try {
       const data = await api('/auth/login', 'POST', { email: username.trim(), password });
       await saveToken(data.token); await saveUser(data.user);
+      // Store refresh token so Face ID can use it without ever re-storing the password
+      if (data.refresh) await saveBioRefresh(data.refresh);
       onAuth(data.token, data.user);
     } catch (e) { setErr(e.message); }
     finally { setLoading(false); }
@@ -1736,6 +1749,7 @@ function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
       if (inviteToken) body.invite_token = inviteToken; // auto-connects inviter as contact
       const data = await api('/auth/register', 'POST', body);
       await saveToken(data.token); await saveUser(data.user);
+      if (data.refresh) await saveBioRefresh(data.refresh);
       onAuth(data.token, data.user);
     } catch (e) { setErr(e.message); }
     finally { setLoading(false); }
@@ -3452,9 +3466,10 @@ function ProfileTab({ token, currentUser, onLogout }) {
     if (!bioPassword.trim()) { setBioErr('Password is required.'); return; }
     setBioLoading(true); setBioErr('');
     try {
-      await api('/auth/login', 'POST', { email: currentUser.email, password: bioPassword });
+      const data = await api('/auth/login', 'POST', { email: currentUser.email, password: bioPassword });
       await saveBioEnabled(true);
-      await saveBioCreds(currentUser.email, bioPassword);
+      // Store the refresh token — never store the password
+      if (data.refresh) await saveBioRefresh(data.refresh);
       setBioEnabled(true); setShowBioModal(false); setBioPassword('');
       Alert.alert('FACE ID ENABLED', 'Face ID will unlock the app on your next launch.');
     } catch (e) { setBioErr(e.message || 'Incorrect password.'); }
