@@ -4236,20 +4236,31 @@ function ProfileTab({ token, currentUser, onLogout }) {
 
   useEffect(() => {
     (async () => {
-      setBioAvailable(await isBiometricReady());
-      setBioEnabled(await loadBioEnabled());
-      const ext = await loadProfileExt();
+      const [bioReady, bioOn, ext, pmMsgs, pmSend, pmCal, pmCon, savedUri] = await Promise.all([
+        isBiometricReady(),
+        loadBioEnabled(),
+        loadProfileExt(),
+        loadBannerPerm(BANNER_PERM_MSGS_KEY),
+        loadBannerPerm(BANNER_PERM_SEND_KEY),
+        loadBannerPerm(BANNER_PERM_CAL_KEY),
+        loadBannerPerm(BANNER_PERM_CON_KEY),
+        SecureStore.getItemAsync(PROFILE_IMAGE_KEY),
+      ]);
+      setBioAvailable(bioReady);
+      setBioEnabled(bioOn);
       setDisplayName(ext.displayName ?? currentUser.display_name ?? currentUser.username ?? '');
       setPhone(ext.phone ?? '');
       setResidentialAddr(ext.residentialAddr ?? '');
       setWorkAddr(ext.workAddr ?? '');
-      setBpMsgs(await loadBannerPerm(BANNER_PERM_MSGS_KEY));
-      setBpSend(await loadBannerPerm(BANNER_PERM_SEND_KEY));
-      setBpCal(await loadBannerPerm(BANNER_PERM_CAL_KEY));
-      setBpCon(await loadBannerPerm(BANNER_PERM_CON_KEY));
-      // Load saved profile image
-      const uri = await SecureStore.getItemAsync(PROFILE_IMAGE_KEY);
-      if (uri) setProfileImageUri(uri);
+      setBpMsgs(pmMsgs); setBpSend(pmSend); setBpCal(pmCal); setBpCon(pmCon);
+      // Load saved profile image — verify file still exists on disk
+      if (savedUri) {
+        try {
+          const info = await FileSystem.getInfoAsync(savedUri);
+          if (info.exists) setProfileImageUri(savedUri);
+          else await SecureStore.deleteItemAsync(PROFILE_IMAGE_KEY);
+        } catch { /* URI invalid — leave as letter avatar */ }
+      }
     })();
   }, []);
 
@@ -4270,17 +4281,6 @@ function ProfileTab({ token, currentUser, onLogout }) {
       setProfileImageUri(finalUri);
       await SecureStore.setItemAsync(PROFILE_IMAGE_KEY, finalUri);
     }
-  };
-
-  const handleSaveDisplayName = async () => {
-    if (!displayName.trim()) return;
-    try {
-      const ext = { displayName: displayName.trim(), phone, residentialAddr, workAddr };
-      await saveProfileExt(ext);
-      try { await api('/api/profile', 'PATCH', { display_name: displayName.trim() }, token); } catch {}
-      setSaveProfileOk('NAME SAVED');
-      setTimeout(() => setSaveProfileOk(''), 2000);
-    } catch (e) { setSaveProfileErr(e.message); }
   };
 
   const handleSaveProfile = async () => {
@@ -4371,10 +4371,7 @@ function ProfileTab({ token, currentUser, onLogout }) {
         }
         <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, marginTop: 6, letterSpacing: 0.5 }}>tap to change photo</Text>
       </TouchableOpacity>
-      <TouchableOpacity onLongPress={handleSaveDisplayName} delayLongPress={600} activeOpacity={0.75} style={{ alignItems: 'center', marginBottom: 4 }}>
-        <Text style={{ fontFamily: mono, fontSize: 16, fontWeight: '700', color: C.text, textAlign: 'center', letterSpacing: 1 }}>{displayName || currentUser.display_name || currentUser.displayName || currentUser.username}</Text>
-        <Text style={{ fontFamily: mono, fontSize: 9, color: C.dim, letterSpacing: 1, marginTop: 2 }}>HOLD TO SAVE NAME</Text>
-      </TouchableOpacity>
+      <Text style={{ fontFamily: mono, fontSize: 16, fontWeight: '700', color: C.text, textAlign: 'center', letterSpacing: 1, marginBottom: 4 }}>{displayName || currentUser.display_name || currentUser.displayName || currentUser.username}</Text>
       <Text style={{ fontFamily: mono, fontSize: 11, color: C.dim, textAlign: 'center', letterSpacing: 1, marginBottom: 16 }}>@{currentUser.username}</Text>
 
       {/* ── READ-ONLY INFO ──────────────────────────────────────────── */}
