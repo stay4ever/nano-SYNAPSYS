@@ -26,4 +26,7 @@ web-build/
 ngrok_recovery_codes.txt
 .env
 .env.local
-/ios
+# ios/ is committed (bare workflow) — exclude only generated artifacts
+ios/build/
+ios/Pods/
+ios/*.xcworkspace

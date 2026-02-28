@@ -2,7 +2,7 @@
   "expo": {
     "name": "nano-SYNAPSYS",
     "slug": "nano-synapsys",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "scheme": "nanosynapsys",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
