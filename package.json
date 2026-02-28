@@ -9,6 +9,8 @@
     "testflight": "eas submit --platform ios"
   },
   "dependencies": {
+    "@noble/hashes": "^2.0.1",
+    "@op-engineering/op-sqlite": "^15.2.5",
     "expo": "~54.0.0",
     "expo-calendar": "~15.0.8",
     "expo-clipboard": "~8.0.8",
@@ -27,5 +29,8 @@
   },
   "devDependencies": {
     "@babel/core": "^7.25.0"
+  },
+  "op-sqlite": {
+    "sqlcipher": true
   }
 }

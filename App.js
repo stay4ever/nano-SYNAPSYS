@@ -53,6 +53,13 @@ const naclUtil = require('tweetnacl-util');
 // Signal Protocol — X3DH + Double Ratchet + Sender Keys
 // eslint-disable-next-line import/no-commonjs
 const SIG      = require('./src/signal_protocol');
+// Phase 4: Offline DB + Cloudflare R2 encrypted media
+// eslint-disable-next-line import/no-commonjs
+const DB    = require('./src/db');
+// eslint-disable-next-line import/no-commonjs
+const SYNC  = require('./src/sync');
+// eslint-disable-next-line import/no-commonjs
+const MEDIA = require('./src/media');
 
 // ---------------------------------------------------------------------------
 // COLOUR PALETTES
@@ -150,7 +157,8 @@ function makeRawStyles(C) {
     homeHeader: {
       backgroundColor: C.surface,
       borderBottomWidth: 1, borderBottomColor: C.border,
-      paddingHorizontal: 16, paddingVertical: 12, alignItems: 'center',
+      paddingHorizontal: 16, paddingVertical: 12,
+      flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
     },
     homeTitle: {
       fontFamily: mono, fontSize: 22, fontWeight: '800',
@@ -1238,6 +1246,7 @@ function fmtDate(iso) {
 }
 function isImageContent(c) { return typeof c === 'string' && c.startsWith('data:image'); }
 function isLocationContent(c) { return typeof c === 'string' && c.includes('[LOCATION:'); }
+function isMediaMsg(c) { return MEDIA.isMediaPayload(c); }
 
 // ---------------------------------------------------------------------------
 // NOTIFICATION HELPERS
@@ -2769,7 +2778,8 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
   const listRef                 = useRef(null);
   const disappearTimers         = useRef([]);
   const peerPkRef               = useRef(null);  // cached peer public key (legacy compat)
-  const [decryptedMsgs, setDecryptedMsgs] = useState({});
+  const [decryptedMsgs,  setDecryptedMsgs]  = useState({});
+  const [decryptedMedia, setDecryptedMedia] = useState({});
 
   // Pre-fetch peer's public key for E2EE (legacy NaCl compat)
   useEffect(() => {
@@ -2789,9 +2799,28 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
   const fetchHistory = useCallback(async () => {
     setLoading(true); setErr('');
     try {
-      const data = await api(`/api/messages/${peer.id}`, 'GET', null, token);
-      setMessages(Array.isArray(data) ? data : []);
-    } catch (e) { setErr(e.message); }
+      // 1. Load cached messages from local DB immediately (instant)
+      const local = await DB.getLocalMessages(`dm_${peer.id}`);
+      if (local.length > 0) { setMessages(local); setLoading(false); }
+      // 2. Delta-sync new messages from backend (decrypt + persist in SYNC)
+      await SYNC.syncDM(peer.id, token, decryptDM);
+      // 3. Reload DB to show any new messages
+      const fresh = await DB.getLocalMessages(`dm_${peer.id}`);
+      if (fresh.length > 0) {
+        setMessages(fresh);
+      } else if (local.length === 0) {
+        // No local cache at all — try direct API fetch
+        const data = await api(`/api/messages/${peer.id}`, 'GET', null, token);
+        setMessages(Array.isArray(data) ? data : []);
+      }
+    } catch (e) {
+      setErr(e.message);
+      // Graceful fallback: direct API call
+      try {
+        const data = await api(`/api/messages/${peer.id}`, 'GET', null, token);
+        setMessages(Array.isArray(data) ? data : []);
+      } catch {}
+    }
     finally { setLoading(false); }
   }, [token, peer.id]);
 
@@ -2827,7 +2856,8 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
     if (messages.length > 0) setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 100);
   }, [messages]);
 
-  // Async decrypt all encrypted DMs whenever the message list changes
+  // Async decrypt all encrypted DMs whenever the message list changes.
+  // Also persists newly decrypted messages to the local SQLCipher DB.
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -2836,7 +2866,22 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
         if (isEncryptedDM(msg.content)) {
           const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? '');
           const plain = await decryptDM(msg.content, sid, token);
-          updates[msg.id] = plain ?? '[Encrypted — cannot decrypt]';
+          const resolved = plain ?? '[Encrypted — cannot decrypt]';
+          updates[msg.id] = resolved;
+          // Persist to local DB (INSERT OR IGNORE — safe to call repeatedly)
+          if (plain !== null) {
+            DB.persistMessage(`dm_${peer.id}`, msg.id, sid, plain, msg.created_at).catch(() => {});
+          }
+        }
+        // Trigger media decryption for any message whose resolved content is a media payload
+        const resolved = isEncryptedDM(msg.content) ? updates[msg.id] : msg.content;
+        if (resolved && MEDIA.isMediaPayload(resolved) && !decryptedMedia[msg.id]) {
+          const mp = MEDIA.parseMediaPayload(resolved);
+          if (mp) {
+            MEDIA.decryptMedia(mp.url, mp.key, mp.iv).then(uri => {
+              if (alive) setDecryptedMedia(prev => ({ ...prev, [msg.id]: uri }));
+            }).catch(() => {});
+          }
         }
       }
       if (alive && Object.keys(updates).length > 0) {
@@ -2844,7 +2889,7 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
       }
     })();
     return () => { alive = false; };
-  }, [messages, token]);
+  }, [messages, token, peer.id]);
 
   const sendMessage = useCallback(async (overrideContent = null) => {
     const content = overrideContent ?? text.trim();
@@ -2881,9 +2926,17 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
   }, [text, peer.id, currentUser.id, wsRef, token, disappear]);
 
   const handleAttachment = useCallback(async () => {
-    // Images are sent via REST (not WebSocket) so size is not a concern at the
-    // transport layer, but we still compress to save DB space and load time.
-    const pickerOpts = { quality: 0.25, base64: true, exif: false };
+    const pickerOpts = { quality: 0.4, base64: true, exif: false };
+    const uploadAndSend = async (a) => {
+      if (!a.base64) { Alert.alert('ERROR', 'Could not read image data.'); return; }
+      try {
+        const mimeType = a.mimeType ?? 'image/jpeg';
+        const { url, key, iv } = await MEDIA.uploadEncryptedMedia(a.base64, mimeType, token);
+        await sendMessage(MEDIA.mediaPayload(url, key, iv));
+      } catch (e) {
+        Alert.alert('UPLOAD ERROR', e.message ?? 'Image upload failed.');
+      }
+    };
     Alert.alert('ATTACH', 'Select source', [
       {
         text: 'CAMERA',
@@ -2891,11 +2944,7 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
           const perm = await ImagePicker.requestCameraPermissionsAsync();
           if (perm.status !== 'granted') { Alert.alert('PERMISSION DENIED', 'Camera access required.'); return; }
           const res = await ImagePicker.launchCameraAsync(pickerOpts);
-          if (!res.canceled && res.assets?.[0]) {
-            const a = res.assets[0];
-            if (!a.base64) { Alert.alert('ERROR', 'Could not read image data.'); return; }
-            sendMessage(`data:${a.mimeType ?? 'image/jpeg'};base64,${a.base64}`);
-          }
+          if (!res.canceled && res.assets?.[0]) await uploadAndSend(res.assets[0]);
         },
       },
       {
@@ -2903,19 +2952,13 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
         onPress: async () => {
           const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
           if (perm.status !== 'granted') { Alert.alert('PERMISSION DENIED', 'Photo library access required.'); return; }
-          const res = await ImagePicker.launchImageLibraryAsync({
-            ...pickerOpts, mediaTypes: 'images',
-          });
-          if (!res.canceled && res.assets?.[0]) {
-            const a = res.assets[0];
-            if (!a.base64) { Alert.alert('ERROR', 'Could not read image data.'); return; }
-            sendMessage(`data:${a.mimeType ?? 'image/jpeg'};base64,${a.base64}`);
-          }
+          const res = await ImagePicker.launchImageLibraryAsync({ ...pickerOpts, mediaTypes: 'images' });
+          if (!res.canceled && res.assets?.[0]) await uploadAndSend(res.assets[0]);
         },
       },
       { text: 'CANCEL', style: 'cancel' },
     ]);
-  }, [sendMessage]);
+  }, [sendMessage, token]);
 
   const handleShareLocation = useCallback(async () => {
     const { status } = await Location.requestForegroundPermissionsAsync();
@@ -2929,14 +2972,15 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
   }, [sendMessage]);
 
   const isMine = (msg) => String(msg.from_user?.id ?? msg.from_user) === String(currentUser.id);
-  // Resolve plaintext from a message — reads from async-decrypted cache
+  // Resolve plaintext from a message — reads from async-decrypted cache or DB-loaded content
   const resolveContent = (msg) => {
-    if (isEncryptedDM(msg.content)) {
-      const plain = decryptedMsgs[msg.id];
-      return { text: plain ?? '[Decrypting…]', encrypted: true, failed: plain === undefined };
-    }
-    return { text: msg.content, encrypted: false, failed: false };
+    const raw = isEncryptedDM(msg.content) ? decryptedMsgs[msg.id] : msg.content;
+    const isEnc = isEncryptedDM(msg.content);
+    if (!raw && isEnc) return { text: '[Decrypting…]', encrypted: true, failed: false, isMedia: false };
+    if (raw && MEDIA.isMediaPayload(raw)) return { text: '', encrypted: isEnc, failed: false, isMedia: true };
+    return { text: raw ?? '[Decrypting…]', encrypted: isEnc, failed: !raw && isEnc, isMedia: false };
   };
+  const getMediaUri = (msg) => decryptedMedia[msg.id] ?? null;
 
   return (
     <ThemedSafeArea>
@@ -2959,12 +3003,17 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
               ListEmptyComponent={<Text style={styles.emptyText}>NO MESSAGES YET</Text>}
               renderItem={({ item }) => {
                 const mine = isMine(item);
-                const { text: msgText, encrypted: isEnc, failed } = resolveContent(item);
+                const { text: msgText, encrypted: isEnc, failed, isMedia } = resolveContent(item);
+                const mediaUri = isMedia ? getMediaUri(item) : null;
                 return (
                   <View style={[styles.msgRow, mine ? styles.msgRowMine : styles.msgRowTheirs]}>
                     <View style={[styles.msgBubble, mine ? styles.bubbleMine : styles.bubbleTheirs]}>
                       {isImageContent(item.content) ? (
                         <Image source={{ uri: item.content }} style={styles.imageMsg} resizeMode="contain" />
+                      ) : isMedia ? (
+                        mediaUri
+                          ? <Image source={{ uri: mediaUri }} style={styles.imageMsg} resizeMode="contain" />
+                          : <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 9, color: mine ? '#ffffffaa' : C.dim }}>🔒 Loading image…</Text>
                       ) : isLocationContent(msgText) ? (
                         <TouchableOpacity onPress={() => {
                           const m = msgText.match(/\[LOCATION:([-\d.]+),([-\d.]+)\]/);
@@ -3180,7 +3229,8 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
   const listRef                     = useRef(null);
   const disappearTimers             = useRef([]);
   const groupKeyRef                 = useRef(null);  // legacy NaCl group key (compat)
-  const [decryptedMsgs, setDecryptedMsgs] = useState({});
+  const [decryptedMsgs,  setDecryptedMsgs]  = useState({});
+  const [decryptedMedia, setDecryptedMedia] = useState({});
 
   useEffect(() => () => { disappearTimers.current.forEach(clearTimeout); }, []);
 
@@ -3201,9 +3251,26 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
   const fetchHistory = useCallback(async () => {
     setLoading(true); setErr('');
     try {
-      const data = await api(`/api/groups/${group.id}/messages`, 'GET', null, token);
-      setMessages(Array.isArray(data) ? data : []);
-    } catch (e) { setErr(e.message); }
+      // 1. Load from local DB immediately
+      const local = await DB.getLocalMessages(`group_${group.id}`);
+      if (local.length > 0) { setMessages(local); setLoading(false); }
+      // 2. Delta-sync from backend
+      await SYNC.syncGroup(group.id, token, decryptGroupMsg);
+      // 3. Reload DB
+      const fresh = await DB.getLocalMessages(`group_${group.id}`);
+      if (fresh.length > 0) {
+        setMessages(fresh);
+      } else if (local.length === 0) {
+        const data = await api(`/api/groups/${group.id}/messages`, 'GET', null, token);
+        setMessages(Array.isArray(data) ? data : []);
+      }
+    } catch (e) {
+      setErr(e.message);
+      try {
+        const data = await api(`/api/groups/${group.id}/messages`, 'GET', null, token);
+        setMessages(Array.isArray(data) ? data : []);
+      } catch {}
+    }
     finally { setLoading(false); }
   }, [token, group.id]);
 
@@ -3231,7 +3298,8 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
     if (messages.length > 0) setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 100);
   }, [messages]);
 
-  // Async decrypt all encrypted group messages whenever the message list changes
+  // Async decrypt all encrypted group messages whenever the message list changes.
+  // Also persists newly decrypted messages to the local SQLCipher DB.
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -3240,7 +3308,22 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
         if (isEncryptedGroup(msg.content)) {
           const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? '');
           const plain = await decryptGroupMsg(msg.content, null, sid, group.id);
-          updates[msg.id] = plain ?? '[Encrypted — cannot decrypt]';
+          const resolved = plain ?? '[Encrypted — cannot decrypt]';
+          updates[msg.id] = resolved;
+          // Persist to local DB
+          if (plain !== null) {
+            DB.persistMessage(`group_${group.id}`, msg.id, sid, plain, msg.created_at).catch(() => {});
+          }
+        }
+        // Trigger media decryption for any message whose resolved content is a media payload
+        const resolved = isEncryptedGroup(msg.content) ? updates[msg.id] : msg.content;
+        if (resolved && MEDIA.isMediaPayload(resolved) && !decryptedMedia[msg.id]) {
+          const mp = MEDIA.parseMediaPayload(resolved);
+          if (mp) {
+            MEDIA.decryptMedia(mp.url, mp.key, mp.iv).then(uri => {
+              if (alive) setDecryptedMedia(prev => ({ ...prev, [msg.id]: uri }));
+            }).catch(() => {});
+          }
         }
       }
       if (alive && Object.keys(updates).length > 0) {
@@ -3281,7 +3364,17 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
   }, [text, group.id, currentUser, wsRef, token]);
 
   const handleAttachment = useCallback(async () => {
-    const pickerOpts = { quality: 0.25, base64: true, exif: false };
+    const pickerOpts = { quality: 0.4, base64: true, exif: false };
+    const uploadAndSend = async (a) => {
+      if (!a.base64) { Alert.alert('ERROR', 'Could not read image data.'); return; }
+      try {
+        const mimeType = a.mimeType ?? 'image/jpeg';
+        const { url, key, iv } = await MEDIA.uploadEncryptedMedia(a.base64, mimeType, token);
+        await sendMessage(MEDIA.mediaPayload(url, key, iv));
+      } catch (e) {
+        Alert.alert('UPLOAD ERROR', e.message ?? 'Image upload failed.');
+      }
+    };
     Alert.alert('ATTACH', 'Select source', [
       {
         text: 'CAMERA',
@@ -3289,11 +3382,7 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
           const perm = await ImagePicker.requestCameraPermissionsAsync();
           if (perm.status !== 'granted') { Alert.alert('PERMISSION DENIED', 'Camera access required.'); return; }
           const res = await ImagePicker.launchCameraAsync(pickerOpts);
-          if (!res.canceled && res.assets?.[0]) {
-            const a = res.assets[0];
-            if (!a.base64) { Alert.alert('ERROR', 'Could not read image data.'); return; }
-            sendMessage(`data:${a.mimeType ?? 'image/jpeg'};base64,${a.base64}`);
-          }
+          if (!res.canceled && res.assets?.[0]) await uploadAndSend(res.assets[0]);
         },
       },
       {
@@ -3301,19 +3390,13 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
         onPress: async () => {
           const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
           if (perm.status !== 'granted') { Alert.alert('PERMISSION DENIED', 'Photo library access required.'); return; }
-          const res = await ImagePicker.launchImageLibraryAsync({
-            ...pickerOpts, mediaTypes: 'images',
-          });
-          if (!res.canceled && res.assets?.[0]) {
-            const a = res.assets[0];
-            if (!a.base64) { Alert.alert('ERROR', 'Could not read image data.'); return; }
-            sendMessage(`data:${a.mimeType ?? 'image/jpeg'};base64,${a.base64}`);
-          }
+          const res = await ImagePicker.launchImageLibraryAsync({ ...pickerOpts, mediaTypes: 'images' });
+          if (!res.canceled && res.assets?.[0]) await uploadAndSend(res.assets[0]);
         },
       },
       { text: 'CANCEL', style: 'cancel' },
     ]);
-  }, [sendMessage]);
+  }, [sendMessage, token]);
 
   const handleShareLocation = useCallback(async () => {
     const { status } = await Location.requestForegroundPermissionsAsync();
@@ -3332,12 +3415,13 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
     return String(id) === String(currentUser.id);
   };
   const resolveGroupContent = (msg) => {
-    if (isEncryptedGroup(msg.content)) {
-      const plain = decryptedMsgs[msg.id];
-      return { text: plain ?? '[Decrypting…]', encrypted: true, failed: plain === undefined };
-    }
-    return { text: msg.content, encrypted: false, failed: false };
+    const raw = isEncryptedGroup(msg.content) ? decryptedMsgs[msg.id] : msg.content;
+    const isEnc = isEncryptedGroup(msg.content);
+    if (!raw && isEnc) return { text: '[Decrypting…]', encrypted: true, failed: false, isMedia: false };
+    if (raw && MEDIA.isMediaPayload(raw)) return { text: '', encrypted: isEnc, failed: false, isMedia: true };
+    return { text: raw ?? '[Decrypting…]', encrypted: isEnc, failed: !raw && isEnc, isMedia: false };
   };
+  const getGroupMediaUri = (msg) => decryptedMedia[msg.id] ?? null;
 
   return (
     <ThemedSafeArea>
@@ -3369,13 +3453,18 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
               renderItem={({ item }) => {
                 const mine = isMine(item);
                 const senderName = mine ? 'YOU' : (item.from_display || item.fromDisplay || item.from_username || item.fromUsername || 'UNKNOWN');
-                const { text: msgText, encrypted: isEnc, failed } = resolveGroupContent(item);
+                const { text: msgText, encrypted: isEnc, failed, isMedia } = resolveGroupContent(item);
+                const mediaUri = isMedia ? getGroupMediaUri(item) : null;
                 return (
                   <View style={[styles.msgRow, mine ? styles.msgRowMine : styles.msgRowTheirs]}>
                     <View style={[styles.msgBubble, mine ? styles.bubbleMine : styles.bubbleTheirs]}>
                       {!mine && <Text style={styles.msgSender}>{senderName}</Text>}
                       {isImageContent(item.content) ? (
                         <Image source={{ uri: item.content }} style={styles.imageMsg} resizeMode="contain" />
+                      ) : isMedia ? (
+                        mediaUri
+                          ? <Image source={{ uri: mediaUri }} style={styles.imageMsg} resizeMode="contain" />
+                          : <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 9, color: mine ? '#ffffffaa' : C.dim }}>🔒 Loading image…</Text>
                       ) : isLocationContent(msgText) ? (
                         <TouchableOpacity onPress={() => {
                           const m = msgText.match(/\[LOCATION:([-\d.]+),([-\d.]+)\]/);
@@ -4719,6 +4808,9 @@ function HomeScreen({ token, currentUser, onLogout }) {
   const [disappear, setDisappear]     = useState(null);
   const [notifEnabled, setNotifEnabled] = useState(true);
   const [unreadCounts, setUnreadCounts] = useState({});
+  const [showSearch,     setShowSearch]     = useState(false);
+  const [searchQuery,    setSearchQuery]    = useState('');
+  const [searchResults,  setSearchResults]  = useState([]);
 
   const wsRef          = useRef(null);
   const reconnectRef   = useRef(null);
@@ -4757,6 +4849,19 @@ function HomeScreen({ token, currentUser, onLogout }) {
     notifRef.current = v;
     saveNotifEnabled(v);
   }, []);
+
+  // Debounced full-text search across local SQLCipher DB
+  useEffect(() => {
+    if (!showSearch) { setSearchResults([]); return; }
+    const t = setTimeout(async () => {
+      if (!searchQuery.trim()) { setSearchResults([]); return; }
+      try {
+        const res = await DB.searchMessages(searchQuery);
+        setSearchResults(Array.isArray(res) ? res : []);
+      } catch {}
+    }, 300);
+    return () => clearTimeout(t);
+  }, [searchQuery, showSearch]);
 
   const connectWS = useCallback(() => {
     if (reconnectRef.current) { clearTimeout(reconnectRef.current); reconnectRef.current = null; }
@@ -4907,9 +5012,62 @@ function HomeScreen({ token, currentUser, onLogout }) {
     <ThemedSafeArea>
       <StatusBar barStyle="light-content" backgroundColor={C.bg} />
       <View style={styles.homeHeader}>
-        <Text style={styles.homeTitle}>nano-SYNAPSYS</Text>
-        <Text style={styles.homeSubtitle}>AI EVOLUTION MESH</Text>
+        <View>
+          <Text style={styles.homeTitle}>nano-SYNAPSYS</Text>
+          <Text style={styles.homeSubtitle}>AI EVOLUTION MESH</Text>
+        </View>
+        <TouchableOpacity onPress={() => { setShowSearch(true); setSearchQuery(''); }} style={{ padding: 8 }}>
+          <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 16, color: C.accent }}>⌕</Text>
+        </TouchableOpacity>
       </View>
+
+      {/* Search overlay */}
+      <Modal visible={showSearch} animationType="slide" onRequestClose={() => setShowSearch(false)}>
+        <ThemedSafeArea>
+          <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: C.border }}>
+            <TextInput
+              style={[styles.chatInput, { flex: 1, marginRight: 8 }]}
+              placeholder="SEARCH MESSAGES…" placeholderTextColor={C.muted}
+              value={searchQuery} onChangeText={setSearchQuery}
+              autoFocus autoCorrect={false} spellCheck={false}
+            />
+            <TouchableOpacity onPress={() => setShowSearch(false)}>
+              <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 11, color: C.accent, letterSpacing: 1 }}>CLOSE</Text>
+            </TouchableOpacity>
+          </View>
+          <FlatList
+            data={searchResults}
+            keyExtractor={(r) => String(r.id)}
+            ListEmptyComponent={
+              <Text style={[styles.emptyText, { marginTop: 32 }]}>
+                {searchQuery.trim() ? 'NO RESULTS' : 'TYPE TO SEARCH'}
+              </Text>
+            }
+            renderItem={({ item }) => {
+              const isGroup = item.convo_key?.startsWith('group_');
+              const label = isGroup
+                ? `GROUP — ${item.convo_key?.replace('group_', '')}`
+                : `DM — ${item.convo_key?.replace('dm_', '')}`;
+              return (
+                <TouchableOpacity
+                  style={{ padding: 12, borderBottomWidth: 1, borderBottomColor: C.border }}
+                  onPress={() => {
+                    setShowSearch(false);
+                    // Navigate to the relevant conversation
+                    if (isGroup) { setActiveTab('GROUPS'); }
+                    else { setActiveTab('CHATS'); }
+                  }}
+                >
+                  <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 9, color: C.dim, marginBottom: 2, letterSpacing: 1 }}>{label}</Text>
+                  <Text style={[styles.msgText, { color: C.text }]} numberOfLines={2}>{item.content}</Text>
+                  <Text style={styles.msgTime}>{fmtTime(item.created_at)}</Text>
+                </TouchableOpacity>
+              );
+            }}
+          />
+        </ThemedSafeArea>
+      </Modal>
+
       {/* KeyboardAvoidingView wraps content+tabbar so Banner input slides above keyboard */}
       <KeyboardAvoidingView style={styles.flex} behavior={KAV_BEHAVIOR} enabled={activeTab === 'BOT'}>
         <View style={styles.flex}>
