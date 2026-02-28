@@ -2036,10 +2036,15 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
     if (phone) await saveStatus(phone, { s: 'c' });
   };
 
-  // Clear a pending invite locally so the contact can be invited again
+  // Cancel a pending invite — expires it on the server then clears local state
   const cancelInvite = async (phone) => {
     const map = await _pcLoad();
     const key = _nrmPh(phone);
+    // If we stored the invite token, tell the server to expire it immediately
+    const storedToken = map[key]?.t;
+    if (storedToken) {
+      try { await api(`/api/invites/cancel/${storedToken}`, 'DELETE', null, token); } catch {}
+    }
     delete map[key];
     try { await SecureStore.setItemAsync(_PC_KEY, JSON.stringify(map)); } catch {}
     setPhoneStatuses(prev => { const n = { ...prev }; delete n[key]; return n; });
@@ -2080,7 +2085,8 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
     setInviting(contact.id);
     try {
       const data = await api('/api/invites', 'POST', {}, token);
-      const inviteUrl = data.invite_url || data.url;
+      const inviteUrl   = data.invite_url || data.url;
+      const inviteToken = data.token || null;   // store for server-side cancel
       if (!inviteUrl) { Alert.alert('ERROR', 'Could not generate invite link.'); return; }
 
       const senderName = currentUser?.display_name || currentUser?.username || 'A friend';
@@ -2108,7 +2114,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
         sent = true;
         showToast(`Link copied — paste it to ${contact.name}`);
       }
-      if (sent) await saveStatus(contact.phone, { s: 'i', e: Date.now() + 25 * 60 * 1000 });
+      if (sent) await saveStatus(contact.phone, { s: 'i', e: Date.now() + 25 * 60 * 1000, t: inviteToken });
     } catch (e) { Alert.alert('ERROR', e.message || 'Failed to send invite.'); }
     finally { setInviting(null); }
   };
