@@ -2,7 +2,7 @@
 import 'react-native-get-random-values';
 /**
  * SYNAPTYC
- * AI Evolution secure messaging + bot client
+ * nano-SYNAPSYS secure messaging + bot client
  * React Native (Expo) — single-file architecture
  */
 
@@ -81,6 +81,7 @@ const GREEN_C = {
   green:       '#00C832',
   amber:       '#f59e0b',
   red:         '#ef4444',
+  silver:      '#C0C0C0',
   accentFaint: 'rgba(0,255,65,0.07)',
   accentDim:   'rgba(0,255,65,0.15)',
   accentMid:   'rgba(0,255,65,0.30)',
@@ -100,6 +101,7 @@ const TACTICAL_C = {
   green:       '#6888a0',
   amber:       '#b89060',
   red:         '#c04848',
+  silver:      '#A0A0B0',
   accentFaint: 'rgba(168,184,204,0.07)',
   accentDim:   'rgba(168,184,204,0.15)',
   accentMid:   'rgba(168,184,204,0.30)',
@@ -713,6 +715,8 @@ const sigSKStore     = (gid, sid) => `sig_sk_${gid}_${sid}`;
 // In-memory caches
 const _sigSessions    = {};   // { [userId]:  drSession  }
 const _sigSenderKeys  = {};   // { [`${gid}_${sid}`]: senderKeyState }
+const _groupKeyCache  = {};   // { [groupId]: groupKey }
+const _pkCache        = {};   // { [userId]: base64PublicKey }
 
 // ── Legacy NaCl compat (kept for reading old messages) ───────────────────────
 const _b64enc = (buf) => naclUtil.encodeBase64(buf);
@@ -1075,15 +1079,25 @@ async function generateAndDistributeGroupKey(groupId, memberPubKeys, token, myId
  * Caches in memory and SecureStore.
  */
 async function loadGroupSenderKeys(groupId, token, myId) {
+  // 1. Try loading sender keys from local SecureStore first (instant, no network)
   try {
     const serverKeys = await api(`/api/signal/sender-keys/${groupId}`, 'GET', null, token);
     for (const { sender_id, encrypted_sk } of (serverKeys || [])) {
       const cacheKey = `${groupId}_${sender_id}`;
       if (_sigSenderKeys[cacheKey]) continue;
 
+      // Try SecureStore first (already decrypted and cached from prior session)
+      try {
+        const stored = await SecureStore.getItemAsync(sigSKStore(groupId, sender_id));
+        if (stored) {
+          _sigSenderKeys[cacheKey] = SIG.deserialiseSKState(stored);
+          continue;
+        }
+      } catch {}
+
+      // Decrypt from server envelope
       try {
         const env  = JSON.parse(encrypted_sk);
-        const hdr  = JSON.parse(env.hdr);
         const plain = await decryptDM(
           JSON.stringify({ sig: true, v: 1, hdr: env.hdr, ct: env.ct }),
           sender_id, token
@@ -1976,7 +1990,7 @@ function BiometricUnlockScreen({ onUnlock, onUsePassword }) {
       <View style={styles.centerFill}>
         <Image source={require('./assets/icon.png')} style={{ width: 96, height: 96, borderRadius: 22, marginBottom: 10 }} resizeMode="contain" />
         <Text style={[styles.logoText, { fontSize: 18, letterSpacing: 3 }]}>SYNAPTYC</Text>
-        <Text style={styles.logoSub}>BY AI EVOLUTION</Text>
+        <Text style={styles.logoSub}>BY nano-SYNAPSYS</Text>
         <View style={{ height: 48 }} />
         <TouchableOpacity onPress={() => tryBiometric(false)} disabled={loading} activeOpacity={0.7}>
           <VaultIcon size={72} />
@@ -2196,7 +2210,7 @@ function AuthScreen({ onAuth, inviteToken = null, inviterName = null }) {
             resizeMode="contain"
           />
           <Text style={[styles.logoText, { fontSize: 18, letterSpacing: 3 }]}>SYNAPTYC</Text>
-          <Text style={styles.logoSub}>BY AI EVOLUTION</Text>
+          <Text style={styles.logoSub}>BY nano-SYNAPSYS</Text>
         </View>
 
         {/* Invite banner */}
@@ -2489,6 +2503,7 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
   const [autoSearching,   setAutoSearching]   = useState(false);
   const [toast,           setToast]           = useState('');   // inline feedback bar
   const toastTimer = useRef(null);
+  const autoSearchCooldownRef = useRef(0);
 
   const showToast = (msg) => {
     setToast(msg);
@@ -2562,41 +2577,51 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
     }
   };
 
-  // Auto-detect which phone contacts are already confirmed app contacts (green LED)
+  // Phone-based contact discovery: single batch lookup by phone number (Signal model)
+  // Uses last-7-digit suffix matching to handle country code differences
   const autoSearchContacts = async (contacts, confirmedIds) => {
+    if (Date.now() - autoSearchCooldownRef.current < 60000) return;
     setAutoSearching(true);
     const ids = confirmedIds || appContactIds;
-    const todo = contacts.slice(0, 50); // cap at 50 to stay responsive
-    const results = await Promise.allSettled(todo.map(async (c) => {
-      const q = c.name.split(' ')[0].trim();
-      if (q.length < 2) return null;
-      try {
-        const data = await api(`/api/users/search?q=${encodeURIComponent(q)}`, 'GET', null, token);
-        const all = Array.isArray(data) ? data : [];
-        if (all.length === 0) return null;
-        // ONLY match users already confirmed as contacts — never auto-add strangers
-        const match = all.find(u => ids.has(u.id));
-        return match ? { phone: c.phone, user: match } : null;
-      } catch { return null; }
-    }));
-    const map = {};
-    for (const r of results) {
-      if (r.status !== 'fulfilled' || !r.value) continue;
-      const { phone, user } = r.value;
-      map[phone] = user;
-      // Set green LED for confirmed contacts
-      await _pcSave(phone, { s: 'c' });
+
+    // Build maps: normalized phone -> contact, AND last7 -> contact (for fuzzy match)
+    const phoneMap = {};   // exact normalized → contact
+    const suffixMap = {};  // last 7 digits → contact
+    for (const c of contacts) {
+      const norm = _nrmPh(c.phone);
+      if (norm.length >= 7) {
+        phoneMap[norm] = c;
+        suffixMap[norm.slice(-7)] = c;
+      }
     }
-    setPhoneStatuses(await _pcLoad());
-    setAutoMatchedMap(map);
+
+    try {
+      const matches = await api('/api/users/phone-lookup', 'POST',
+        { phones: Object.keys(phoneMap) }, token);
+      const map = {};
+      for (const m of (Array.isArray(matches) ? matches : [])) {
+        const mNorm = _nrmPh(m.phone);
+        // Try exact match first, then suffix match (last 7 digits)
+        const contact = phoneMap[mNorm] || suffixMap[mNorm.slice(-7)];
+        if (contact) {
+          map[contact.phone] = m;
+          const status = ids.has(m.id) ? 'c' : 'g';
+          await _pcSave(contact.phone, { s: status });
+        }
+      }
+      setPhoneStatuses(await _pcLoad());
+      setAutoMatchedMap(map);
+    } catch {}
+
     setAutoSearching(false);
+    autoSearchCooldownRef.current = Date.now();
   };
 
   const getPhoneStatus = (phone) => {
     const entry = phoneStatuses[_nrmPh(phone)];
     if (!entry) return null;
     if (entry.s === 'i' && entry.e && entry.e < Date.now()) return null;
-    return entry.s;  // 'c' = green | 'i' = amber
+    return entry.s;  // 'c' = connected | 'g' = has app | 'i' = invited
   };
 
   const saveStatus = async (phone, entry) => {
@@ -2794,7 +2819,11 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
                 const ps = getPhoneStatus(c.phone);
                 const matched = autoMatchedMap[c.phone];
                 const onApp = !!matched;
-                const ledColor = ps === 'c' ? C.accent : ps === 'i' ? C.amber : onApp ? C.green : C.red;
+                const ledColor = ps === 'c'
+                  ? (matched?.online ? C.accent : C.silver)
+                  : ps === 'g' ? C.green
+                  : ps === 'i' ? C.amber
+                  : C.red;
                 return (
                   <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: C.border }}>
                     <View style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: ledColor, marginRight: 12, flexShrink: 0 }} />
@@ -2930,9 +2959,10 @@ function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
   useEffect(() => { fetchUsers(); }, [fetchUsers]);
 
   const deleteChat = useCallback(async (user) => {
+    const name = user.displayName || user.display_name || user.username;
     Alert.alert(
       'DELETE CHAT',
-      `Delete conversation with ${user.displayName || user.display_name || user.username}?`,
+      `This will permanently delete all your chat history with ${name}. This action cannot be undone.`,
       [
         { text: 'CANCEL', style: 'cancel' },
         {
@@ -2940,7 +2970,10 @@ function ChatsTab({ token, currentUser, onOpenDM, unread = {} }) {
           onPress: async () => {
             setUsers(prev => prev.filter(u => u.id !== user.id));
             try {
+              // Delete from backend
               await api(`/api/messages/delete/${user.id}`, 'DELETE', null, token);
+              // Clear local DB cache
+              await DB.deleteConversation(`dm_${user.id}`);
             } catch (e) { setErr(e.message); fetchUsers(); }
           },
         },
@@ -3141,9 +3174,17 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
     const belongs = (fromId === peerId && toId === meId) ||
                     (fromId === meId   && toId === peerId);
     if (belongs) {
+      const fromMe = fromId === meId;
       setMessages((prev) => {
-        const exists = prev.some((m) => m.id === incomingMsg.id);
-        return exists ? prev : [...prev, incomingMsg];
+        // Remove temp (optimistic) messages from self when real echo arrives
+        const base = fromMe ? prev.filter(m => !m._temp) : prev;
+        if (base.some(m => m.id === incomingMsg.id)) return base;
+        // Pre-populate decrypted cache — own echoed messages have plaintext in temp
+        if (fromMe && isEncryptedDM(incomingMsg.content)) {
+          const tempMsg = prev.find(m => m._temp);
+          if (tempMsg) setDecryptedMsgs(p => ({ ...p, [incomingMsg.id]: tempMsg.content }));
+        }
+        return [...base, incomingMsg];
       });
       // Schedule disappear if requested — track timer so it's cancelled on unmount
       if (incomingMsg.disappear_after && incomingMsg.disappear_after > 0) {
@@ -3168,13 +3209,24 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
       const updates = {};
       for (const msg of messages) {
         if (isEncryptedDM(msg.content)) {
-          const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? '');
-          const plain = await decryptDM(msg.content, sid, token);
-          const resolved = plain ?? '[Encrypted — cannot decrypt]';
-          updates[msg.id] = resolved;
-          // Persist to local DB (INSERT OR IGNORE — safe to call repeatedly)
-          if (plain !== null) {
-            DB.persistMessage(`dm_${peer.id}`, msg.id, sid, plain, msg.created_at).catch(() => {});
+          // Skip if already decrypted (e.g. own sent messages pre-cached)
+          if (decryptedMsgs[msg.id] && decryptedMsgs[msg.id] !== '[Encrypted — cannot decrypt]' && decryptedMsgs[msg.id] !== '[Decrypting…]') {
+            updates[msg.id] = decryptedMsgs[msg.id];
+          } else {
+            const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? '');
+            let plain = await decryptDM(msg.content, sid, token);
+            // Fallback: try local DB (may have plaintext from prior session)
+            if (plain === null) {
+              try {
+                const cached = await DB.getMessage(`dm_${peer.id}`, msg.id);
+                if (cached?.content) plain = cached.content;
+              } catch {}
+            }
+            const resolved = plain ?? '[Encrypted — cannot decrypt]';
+            updates[msg.id] = resolved;
+            if (plain !== null) {
+              DB.persistMessage(`dm_${peer.id}`, msg.id, sid, plain, msg.created_at).catch(() => {});
+            }
           }
         }
         // Trigger media decryption for any message whose resolved content is a media payload
@@ -3214,15 +3266,23 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
       }
       // Images always go via REST (too large for the WebSocket frame limit).
       // Text goes via WebSocket for real-time delivery; falls back to REST when WS is down.
-      // Phoenix channel: join the room topic, then push via new_message event
       if (!isImage && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && wsRef.current._phxSend) {
         wsRef.current._phxJoin(`room:${peer.id}`);
         const phxPayload = { content: payload };
         if (disappear) phxPayload.disappear_after = disappear;
         wsRef.current._phxSend(`room:${peer.id}`, 'new_message', phxPayload);
-        // No optimistic push — the server echoes the message back via WS
+        // Optimistic push — show plaintext immediately; server echo replaces on arrival
+        const tempId = `temp_${Date.now()}`;
+        setMessages(prev => [...prev, {
+          id: tempId, from_user: currentUser, from: currentUser.id,
+          to: peer.id, content, created_at: new Date().toISOString(), _temp: true,
+        }]);
       } else {
         const msg = await api('/api/messages', 'POST', { to: peer.id, content: payload }, token);
+        // Pre-populate decrypted cache for own encrypted message
+        if (payload !== content && isEncryptedDM(payload)) {
+          setDecryptedMsgs(p => ({ ...p, [msg.id]: content }));
+        }
         setMessages((prev) => prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]);
       }
     } catch (e) { setErr(e.message); if (!overrideContent) setText(content); }
@@ -3275,7 +3335,7 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
     } catch (e) { Alert.alert('ERROR', 'Failed to get location: ' + e.message); }
   }, [sendMessage]);
 
-  const isMine = (msg) => String(msg.from_user?.id ?? msg.from_user) === String(currentUser.id);
+  const isMine = (msg) => String(msg.from_user?.id ?? msg.from_user ?? msg.from) === String(currentUser.id);
   // Resolve plaintext from a message — reads from async-decrypted cache or DB-loaded content
   const resolveContent = (msg) => {
     const raw = isEncryptedDM(msg.content) ? decryptedMsgs[msg.id] : msg.content;
@@ -3615,12 +3675,17 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
   const groupKeyRef                 = useRef(null);  // legacy NaCl group key (compat)
   const [decryptedMsgs,  setDecryptedMsgs]  = useState({});
   const [decryptedMedia, setDecryptedMedia] = useState({});
+  const [senderKeysReady, setSenderKeysReady] = useState(false);
+  const ownPlainRef = useRef({});  // encrypted payload hash → plaintext for own sent messages
 
   useEffect(() => () => { disappearTimers.current.forEach(clearTimeout); }, []);
 
   // Load all Signal sender keys for this group (replaces legacy loadGroupKey)
   useEffect(() => {
-    loadGroupSenderKeys(group.id, token, String(currentUser.id)).catch(() => {});
+    setSenderKeysReady(false);
+    loadGroupSenderKeys(group.id, token, String(currentUser.id))
+      .then(() => setSenderKeysReady(true))
+      .catch(() => setSenderKeysReady(true));
     // Also load legacy NaCl key for backward compat
     loadGroupKey(group.id, token).then(k => { groupKeyRef.current = k; }).catch(() => {});
   }, [group.id, token, currentUser.id]);
@@ -3668,7 +3733,14 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
         const fromMe = String(incomingMsg.from_id ?? incomingMsg.from_user?.id) === String(currentUser.id);
         // Remove any temp (optimistic) messages from self when real echo arrives
         const base = fromMe ? prev.filter(m => !m._temp) : prev;
-        return base.some(m => m.id === incomingMsg.id) ? base : [...base, incomingMsg];
+        if (base.some(m => m.id === incomingMsg.id)) return base;
+        // For own encrypted messages, pre-populate decrypted cache from ownPlainRef
+        if (fromMe && isEncryptedGroup(incomingMsg.content) && ownPlainRef.current[incomingMsg.content]) {
+          const plain = ownPlainRef.current[incomingMsg.content];
+          delete ownPlainRef.current[incomingMsg.content];
+          setDecryptedMsgs(p => ({ ...p, [incomingMsg.id]: plain }));
+        }
+        return [...base, incomingMsg];
       });
       if (incomingMsg.disappear_after && incomingMsg.disappear_after > 0) {
         const msgId = incomingMsg.id;
@@ -3692,16 +3764,28 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
       const updates = {};
       for (const msg of messages) {
         if (isEncryptedGroup(msg.content)) {
-          const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? '');
-          try {
-            const plain = await decryptGroupMsg(msg.content, null, sid, group.id);
-            const resolved = plain ?? '[Encrypted — cannot decrypt]';
-            updates[msg.id] = resolved;
-            if (plain !== null) {
-              DB.persistMessage(`group_${group.id}`, msg.id, sid, plain, msg.created_at).catch(() => {});
+          // Skip if already decrypted (e.g. own sent messages pre-cached)
+          if (decryptedMsgs[msg.id] && decryptedMsgs[msg.id] !== '[Encrypted — cannot decrypt]' && decryptedMsgs[msg.id] !== '[Decrypting…]') {
+            updates[msg.id] = decryptedMsgs[msg.id];
+          } else {
+            const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? '');
+            try {
+              let plain = await decryptGroupMsg(msg.content, null, sid, group.id);
+              // If decryption failed, try local DB (may have plaintext from prior session)
+              if (plain === null) {
+                try {
+                  const cached = await DB.getMessage(`group_${group.id}`, msg.id);
+                  if (cached?.content) plain = cached.content;
+                } catch {}
+              }
+              const resolved = plain ?? '[Encrypted — cannot decrypt]';
+              updates[msg.id] = resolved;
+              if (plain !== null) {
+                DB.persistMessage(`group_${group.id}`, msg.id, sid, plain, msg.created_at).catch(() => {});
+              }
+            } catch {
+              updates[msg.id] = '[Encrypted — cannot decrypt]';
             }
-          } catch {
-            updates[msg.id] = '[Encrypted — cannot decrypt]';
           }
         }
         // Trigger media decryption for any message whose resolved content is a media payload
@@ -3720,7 +3804,7 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
       }
     })();
     return () => { alive = false; };
-  }, [messages, group.id]);
+  }, [messages, group.id, senderKeysReady]);
 
   const sendMessage = useCallback(async (overrideContent = null) => {
     const content = overrideContent ?? text.trim();
@@ -3734,7 +3818,11 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
       if (!isImage && e2eeKey()) {
         try {
           const enc = await encryptGroupMsg(content, null, group.id, String(currentUser.id));
-          if (enc !== null) payload = enc;
+          if (enc !== null) {
+            payload = enc;
+            // Cache plaintext keyed by ciphertext — sender can't decrypt own ratcheted message
+            ownPlainRef.current[enc] = content;
+          }
           // If null: E2EE key not ready — fall back to plaintext silently
         } catch { /* fallback to plaintext */ }
       }
@@ -3750,6 +3838,11 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
         }]);
       } else {
         const msg = await api(`/api/groups/${group.id}/messages`, 'POST', { content: payload }, token);
+        // Pre-populate decrypted cache for own encrypted messages
+        if (ownPlainRef.current[payload]) {
+          setDecryptedMsgs(p => ({ ...p, [msg.id]: ownPlainRef.current[payload] }));
+          delete ownPlainRef.current[payload];
+        }
         setMessages((prev) => prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]);
       }
     } catch (e) { setErr(e.message); if (!overrideContent) setText(content); }
@@ -4312,27 +4405,32 @@ function ProfileTab({ token, currentUser, onLogout, profileImageUri, setProfileI
   const handlePickProfileImage = async () => {
     const res = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: 'images',
-      allowsEditing: true, aspect: [1, 1], quality: 0.7, base64: true,
+      allowsEditing: true, aspect: [1, 1], quality: 0.4, base64: true,
     });
     if (!res.canceled && res.assets?.[0]) {
       const asset = res.assets[0];
-      const destUri = FileSystem.documentDirectory + `profile_avatar_${Date.now()}.jpg`;
+      const destUri = FileSystem.documentDirectory + 'profile_avatar.jpg';
       try {
+        // Save locally first (guaranteed to persist even if upload fails)
         if (asset.base64) {
           await FileSystem.writeAsStringAsync(destUri, asset.base64, { encoding: FileSystem.EncodingType.Base64 });
         } else {
           await FileSystem.copyAsync({ from: asset.uri, to: destUri });
         }
-        setProfileImageUri(destUri);
+        // Cache-bust: append timestamp so Image component reloads
+        const freshUri = destUri + '?t=' + Date.now();
+        setProfileImageUri(freshUri);
         await SecureStore.setItemAsync(PROFILE_IMAGE_KEY, destUri);
-        // Sync avatar to backend so other users can see it
-        try {
-          const b64 = asset.base64 || await FileSystem.readAsStringAsync(destUri, { encoding: FileSystem.EncodingType.Base64 });
-          await api('/api/profile', 'PATCH', { avatar_base64: b64 }, token);
-        } catch {}
-      } catch {
-        // Last resort: use picker URI for this session (won't survive restart)
+      } catch (e) {
+        // Fallback: use picker URI for this session
         setProfileImageUri(asset.uri);
+      }
+      // Sync to backend in background (so other users can see it)
+      try {
+        const b64 = asset.base64 || await FileSystem.readAsStringAsync(destUri, { encoding: FileSystem.EncodingType.Base64 });
+        await api('/api/profile', 'PATCH', { avatar_base64: b64 }, token);
+      } catch (e) {
+        console.warn('[Avatar] backend sync error:', e?.message);
       }
     }
   };
@@ -4419,13 +4517,7 @@ function ProfileTab({ token, currentUser, onLogout, profileImageUri, setProfileI
       <TouchableOpacity onPress={handlePickProfileImage} style={{ alignItems: 'center', marginVertical: 24 }}>
         {profileImageUri
           ? <Image source={{ uri: profileImageUri }} style={{ width: 96, height: 96, borderRadius: 48 }}
-              onError={async () => {
-                // Only clear if the file is truly gone — don't wipe on transient load failures
-                try {
-                  const info = await FileSystem.getInfoAsync(profileImageUri);
-                  if (!info.exists) { setProfileImageUri(null); SecureStore.deleteItemAsync(PROFILE_IMAGE_KEY); }
-                } catch { /* keep the URI — file may still be valid */ }
-              }} />
+              />
           : <View style={{ width: 96, height: 96, borderRadius: 48, backgroundColor: avatarBg, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: C.accent }}>
               <Text style={{ color: '#fff', fontSize: 38, fontWeight: '700', fontFamily: mono }}>{initials}</Text>
             </View>
@@ -4810,7 +4902,7 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
       const deepLink = inviteToken ? `nanosynapsys://join/${inviteToken}` : null;
       const msg = deepLink
         ? `${senderName} invited you to SYNAPTYC — private encrypted messaging.\n\n1. Download the app: https://apps.apple.com/app/id6759710350\n2. Open this link to join: ${deepLink}\n\nOr register at: ${inviteUrl}\n(One-use invite, expires in 25 minutes)`
-        : `${senderName} invited you to SYNAPTYC — private encrypted messaging by AI Evolution. Join here: ${inviteUrl} (expires in 25 minutes, one-use only)`;
+        : `${senderName} invited you to SYNAPTYC — private encrypted messaging by nano-SYNAPSYS. Join here: ${inviteUrl} (expires in 25 minutes, one-use only)`;
 
       // Normalize phone number — strip whitespace/formatting
       const phone = (contact.phone || '').replace(/\s+/g, '');
@@ -5057,10 +5149,13 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
                 {deviceContacts
                   .filter(c => !contactsQuery.trim() || c.name.toLowerCase().includes(contactsQuery.toLowerCase()) || c.phone.includes(contactsQuery))
                   .map(c => {
-                    const ps = getPhoneStatus(c.phone);  // 'c' | 'i' | null
+                    const ps = getPhoneStatus(c.phone);  // 'c' | 'g' | 'i' | null
                     const matched = autoMatchedMap[c.phone];
-                    const onApp = !!matched;
-                    const ledColor = ps === 'c' ? C.accent : ps === 'i' ? C.amber : onApp ? C.accent : C.red;
+                    const ledColor = ps === 'c'
+                      ? (matched?.online ? C.accent : C.silver)
+                      : ps === 'g' ? C.green
+                      : ps === 'i' ? C.amber
+                      : C.red;
                     return (
                       <View key={c.id} style={[styles.contactRow, { paddingVertical: 10 }]}>
                         {/* LED dot */}
@@ -5071,7 +5166,7 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
                           <Text style={styles.contactRowMeta}>{c.phone}</Text>
                         </View>
                         {/* Action area */}
-                        {ps === 'c' || onApp ? (
+                        {ps === 'c' || ps === 'g' ? (
                           <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontSize: 10, color: C.accent, letterSpacing: 0.5 }}>✓ CONTACT</Text>
                         ) : ps === 'i' ? (
                           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
@@ -5328,7 +5423,7 @@ function SettingsTab({ token, currentUser, notifEnabled, onSetNotifEnabled,
       </View>
       <View style={styles.profileCard}>
         <Text style={styles.profileLabel}>NETWORK</Text>
-        <Text style={styles.profileValue}>BY AI EVOLUTION</Text>
+        <Text style={styles.profileValue}>BY nano-SYNAPSYS</Text>
       </View>
       <View style={styles.profileCard}>
         <Text style={styles.profileLabel}>ENCRYPTION</Text>
@@ -5372,10 +5467,34 @@ function HomeScreen({ token, currentUser, onLogout }) {
     SecureStore.getItemAsync(SKIP_AUTH_KEY).then(v => {
       setSkipAuth(Date.now() < parseInt(v || '0', 10));
     });
-    // Load persisted profile image URI
-    SecureStore.getItemAsync(PROFILE_IMAGE_KEY).then(uri => {
-      if (uri) setProfileImageUri(uri);
-    });
+    // Load persisted profile image — check local file first, then restore from server
+    if (token) {
+      (async () => {
+        const destUri = FileSystem.documentDirectory + 'profile_avatar.jpg';
+        const bust = (uri) => uri + '?t=' + Date.now();  // cache-bust for Image component
+        // 1. Check well-known local file first (fastest)
+        try {
+          const info = await FileSystem.getInfoAsync(destUri);
+          if (info.exists && info.size > 0) {
+            setProfileImageUri(bust(destUri));
+            return;
+          }
+        } catch {}
+        // 2. No local file — restore from server
+        try {
+          const profile = await api('/api/profile', 'GET', null, token);
+          if (profile?.avatar_url) {
+            if (profile.avatar_url.startsWith('data:')) {
+              const b64 = profile.avatar_url.split(',')[1];
+              await FileSystem.writeAsStringAsync(destUri, b64, { encoding: FileSystem.EncodingType.Base64 });
+            } else {
+              await FileSystem.downloadAsync(profile.avatar_url, destUri);
+            }
+            setProfileImageUri(bust(destUri));
+          }
+        } catch {}
+      })();
+    }
     // Initialise E2EE keypair (generate if new, upload public key)
     initE2EE(token);
     // Register Expo push token with backend
@@ -5499,7 +5618,7 @@ function HomeScreen({ token, currentUser, onLogout }) {
           const msg = { ...pl, type: 'group_message' };
           setIncomingMsg(msg);
 
-          const fromId  = String(pl.from_user?.id ?? pl.from_user);
+          const fromId  = String(pl.from_user?.id ?? pl.from_user ?? pl.from);
           const meId    = String(currentUser.id);
           const groupId = pl.group_id ?? topic?.split(':')?.[1];
           if (fromId !== meId) {
@@ -5741,9 +5860,11 @@ function AppInner() {
   const handleLogout = useCallback(async () => {
     await clearToken(); await clearUser();
     // Clear all in-memory E2EE state so it cannot leak to the next session.
-    _e2eeKey = null;
+    _sigIdentityKey = null;
     Object.keys(_pkCache).forEach(k => delete _pkCache[k]);
     Object.keys(_groupKeyCache).forEach(k => delete _groupKeyCache[k]);
+    Object.keys(_sigSessions).forEach(k => delete _sigSessions[k]);
+    Object.keys(_sigSenderKeys).forEach(k => delete _sigSenderKeys[k]);
     setToken(null); setUser(null); setAppState('auth');
   }, []);
 
@@ -5752,7 +5873,7 @@ function AppInner() {
       <ThemedView style={styles.splashScreen}>
         <StatusBar barStyle="light-content" backgroundColor={C.bg} />
         <Text style={styles.splashTitle}>SYNAPTYC</Text>
-        <Text style={styles.splashSub}>AI EVOLUTION</Text>
+        <Text style={styles.splashSub}>nano-SYNAPSYS</Text>
         <Spinner size="large" />
       </ThemedView>
     );

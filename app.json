@@ -15,7 +15,7 @@
     },
     "ios": {
       "bundleIdentifier": "com.aievolution.synaptyc",
-      "buildNumber": "12",
+      "buildNumber": "22",
       "supportsTablet": false,
       "icon": "./assets/icon.png",
       "infoPlist": {
@@ -47,7 +47,8 @@
         "android.permission.RECEIVE_BOOT_COMPLETED",
         "android.permission.VIBRATE",
         "android.permission.READ_CALENDAR",
-        "android.permission.WRITE_CALENDAR"
+        "android.permission.WRITE_CALENDAR",
+        "android.permission.WRITE_CONTACTS"
       ]
     },
     "plugins": [
@@ -96,8 +97,9 @@
     ],
     "extra": {
       "eas": {
-        "projectId": "e5532763-45a0-4185-9294-2bd0ef8d1bef"
+        "projectId": "ba1c7dde-e3ed-40ec-bd13-a72a95819d72"
       }
-    }
+    },
+    "owner": "jmarti21"
   }
 }

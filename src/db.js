@@ -182,6 +182,29 @@ async function persistMessage(convoKey, msgId, fromId, plaintext, createdAt) {
   await updateCursor(convoKey, msgId);
 }
 
+/**
+ * Get a single message by convo_key and msg_id.
+ * Returns { id, content, from_id, created_at } or null.
+ */
+async function getMessage(convoKey, msgId) {
+  const db = await openDb();
+  const result = await db.executeAsync(
+    `SELECT id, content, from_id, created_at FROM messages WHERE convo_key = ? AND id = ? LIMIT 1`,
+    [convoKey, String(msgId)]
+  );
+  const rows = result?.rows?._array ?? result?.rows ?? [];
+  return rows.length > 0 ? rows[0] : null;
+}
+
+/**
+ * Delete all messages and sync cursor for a conversation.
+ */
+async function deleteConversation(convoKey) {
+  const db = await openDb();
+  await db.executeAsync(`DELETE FROM messages WHERE convo_key = ?`, [convoKey]);
+  await db.executeAsync(`DELETE FROM sync_cursors WHERE convo_key = ?`, [convoKey]);
+}
+
 module.exports = {
   openDb,
   upsertMessages,
@@ -190,4 +213,6 @@ module.exports = {
   searchMessages,
   getLocalMessages,
   persistMessage,
+  getMessage,
+  deleteConversation,
 };
