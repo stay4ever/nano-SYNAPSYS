@@ -292,8 +292,9 @@ function _drDecryptWithKey(mk, ciphertextB64) {
 
 function _arraysEqual(a, b) {
   if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -437,11 +438,11 @@ function deserialiseSKState(json) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function isSignalDM(content) {
-  try { const o = JSON.parse(content); return o?.sig === true && o?.v === 1; } catch { return false; }
+  try { const o = JSON.parse(content); return o?.sig === true && o?.v === 1 && typeof o?.hdr === 'string' && typeof o?.ct === 'string'; } catch { return false; }
 }
 
 function isSignalGroup(content) {
-  try { const o = JSON.parse(content); return o?.gsig === true && o?.v === 1; } catch { return false; }
+  try { const o = JSON.parse(content); return o?.gsig === true && o?.v === 1 && typeof o?.sid === 'string' && typeof o?.hdr === 'string' && typeof o?.ct === 'string'; } catch { return false; }
 }
 
 // Legacy NaCl DM detection (for backward-compat decryption)

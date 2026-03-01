@@ -961,7 +961,10 @@ async function encryptDM(plaintext, _recipientPkB64_unused, peerId, token) {
 async function decryptDM(envelopeStr, senderId, token) {
   if (!envelopeStr) return null;
   try {
-    const env = JSON.parse(envelopeStr);
+    // Unescape HTML entities — backend may have corrupted the JSON envelope
+    let rawStr = envelopeStr;
+    if (typeof rawStr === 'string' && rawStr.includes('&quot;')) rawStr = _htmlUnescape(rawStr);
+    const env = JSON.parse(rawStr);
 
     // ── Signal Protocol ──────────────────────────────────────────────────────
     if (env?.sig === true && env?.v === 1) {
@@ -1031,9 +1034,30 @@ async function decryptDM(envelopeStr, senderId, token) {
   return null;
 }
 
+/**
+ * Reverse HTML entity escaping applied by the backend.
+ * Fixes messages corrupted by the backend's html_escape() being applied
+ * to encrypted envelopes (backend checked for legacy {"enc": prefix only).
+ */
+function _htmlUnescape(str) {
+  if (typeof str !== 'string') return str;
+  return str
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
 /** Return true if content is a Signal DM or legacy NaCl DM envelope. */
 function isEncryptedDM(content) {
-  return SIG.isSignalDM(content) || SIG.isLegacyNaClDM(content);
+  if (SIG.isSignalDM(content) || SIG.isLegacyNaClDM(content)) return true;
+  // Try unescaping HTML entities (backend may have corrupted the JSON)
+  if (typeof content === 'string' && content.includes('&quot;')) {
+    const fixed = _htmlUnescape(content);
+    return SIG.isSignalDM(fixed) || SIG.isLegacyNaClDM(fixed);
+  }
+  return false;
 }
 
 // ── Group Encryption — Sender Keys ────────────────────────────────────────────
@@ -1147,7 +1171,10 @@ async function encryptGroupMsg(plaintext, _unusedGroupKey, groupId, myId) {
 async function decryptGroupMsg(envelopeStr, _unusedGroupKey, senderId, groupId) {
   if (!envelopeStr) return null;
   try {
-    const env = JSON.parse(envelopeStr);
+    // Unescape HTML entities — backend may have corrupted the JSON envelope
+    let rawStr = envelopeStr;
+    if (typeof rawStr === 'string' && rawStr.includes('&quot;')) rawStr = _htmlUnescape(rawStr);
+    const env = JSON.parse(rawStr);
 
     // ── Signal Sender Key ────────────────────────────────────────────────────
     if (env?.gsig === true) {
@@ -1186,8 +1213,14 @@ async function decryptGroupMsg(envelopeStr, _unusedGroupKey, senderId, groupId) 
 
 /** Return true if content looks like any encrypted group envelope. */
 function isEncryptedGroup(content) {
-  return SIG.isSignalGroup(content) ||
-    (typeof content === 'string' && content.startsWith('{"enc":2'));
+  if (SIG.isSignalGroup(content) ||
+    (typeof content === 'string' && content.startsWith('{"enc":2'))) return true;
+  // Try unescaping HTML entities (backend may have corrupted the JSON)
+  if (typeof content === 'string' && content.includes('&quot;')) {
+    const fixed = _htmlUnescape(content);
+    return SIG.isSignalGroup(fixed) || fixed.startsWith('{"enc":2');
+  }
+  return false;
 }
 
 // Legacy stubs for call sites that haven't been updated yet
@@ -3299,10 +3332,9 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
       // Images always go via REST (too large for the WebSocket frame limit).
       // Text goes via WebSocket for real-time delivery; falls back to REST when WS is down.
       if (!isImage && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && wsRef.current._phxSend) {
-        wsRef.current._phxJoin(`room:${peer.id}`);
-        const phxPayload = { content: payload };
+        const phxPayload = { content: payload, to: peer.id };
         if (disappear) phxPayload.disappear_after = disappear;
-        wsRef.current._phxSend(`room:${peer.id}`, 'new_message', phxPayload);
+        wsRef.current._phxSend(`user:${currentUser.id}`, 'chat_message', phxPayload);
         // Optimistic push — show plaintext immediately; server echo replaces on arrival
         const tempId = `temp_${Date.now()}`;
         setMessages(prev => [...prev, {
@@ -4154,8 +4186,7 @@ function BotTab({ token, wsRef }) {
         );
         if (!target) { Alert.alert('USER NOT FOUND', `"${action.to_username}" is not in your contacts.`); return; }
         if (wsRef?.current?.readyState === WebSocket.OPEN && wsRef.current._phxSend) {
-          wsRef.current._phxJoin(`room:${target.id}`);
-          wsRef.current._phxSend(`room:${target.id}`, 'new_message', { content: action.content });
+          wsRef.current._phxSend(`user:${currentUser.id}`, 'chat_message', { content: action.content, to: target.id });
         } else {
           await api('/api/messages', 'POST', { to: target.id, content: action.content }, token);
         }
