@@ -705,6 +705,10 @@ const KAV_BEHAVIOR = Platform.OS === 'ios' ? 'padding' : 'height';
 let _sigIdentityKey = null;   // { publicKey: Uint8Array, secretKey: Uint8Array }
 let _sigSPK         = null;   // signed pre-key { publicKey, secretKey, id }
 
+// Promise that resolves once initE2EE has loaded keys (prevents decrypt-before-keys race)
+let _e2eeReadyResolve = null;
+let _e2eeReady = new Promise(r => { _e2eeReadyResolve = r; });
+
 // SecureStore keys
 const SIG_IK_STORE   = 'sig_identity_key_v1';
 const SIG_SPK_STORE  = 'sig_signed_prekey_v1';
@@ -853,6 +857,9 @@ async function initE2EE(token) {
 
   } catch (e) {
     console.warn('[Signal] initE2EE error:', e?.message);
+  } finally {
+    // Signal that E2EE keys are loaded (or failed) — unblock any waiting decryptions
+    if (_e2eeReadyResolve) { _e2eeReadyResolve(); _e2eeReadyResolve = null; }
   }
 }
 
@@ -960,6 +967,8 @@ async function encryptDM(plaintext, _recipientPkB64_unused, peerId, token) {
  */
 async function decryptDM(envelopeStr, senderId, token) {
   if (!envelopeStr) return null;
+  // Wait for initE2EE to finish loading keys before attempting decryption
+  await _e2eeReady;
   try {
     // Unescape HTML entities — backend may have corrupted the JSON envelope
     let rawStr = envelopeStr;
@@ -1170,6 +1179,7 @@ async function encryptGroupMsg(plaintext, _unusedGroupKey, groupId, myId) {
  */
 async function decryptGroupMsg(envelopeStr, _unusedGroupKey, senderId, groupId) {
   if (!envelopeStr) return null;
+  await _e2eeReady;
   try {
     // Unescape HTML entities — backend may have corrupted the JSON envelope
     let rawStr = envelopeStr;
@@ -5956,6 +5966,8 @@ function AppInner() {
     await clearToken(); await clearUser();
     // Clear all in-memory E2EE state so it cannot leak to the next session.
     _sigIdentityKey = null;
+    // Reset E2EE ready gate for next login session
+    _e2eeReady = new Promise(r => { _e2eeReadyResolve = r; });
     Object.keys(_pkCache).forEach(k => delete _pkCache[k]);
     Object.keys(_groupKeyCache).forEach(k => delete _groupKeyCache[k]);
     Object.keys(_sigSessions).forEach(k => delete _sigSessions[k]);
