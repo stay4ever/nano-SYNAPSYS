@@ -1229,6 +1229,18 @@ async function api(path, method = 'GET', body = null, token = null, _isRetry = f
   return data;
 }
 
+// Normalise /api/contacts response (backend sends snake_case, client expects camelCase)
+function _normContacts(data) {
+  return (Array.isArray(data) ? data : []).map(c => ({
+    contactId:   c.contactId   ?? c.contact_id,
+    userId:      c.userId      ?? c.user_id,
+    username:    c.username,
+    displayName: c.displayName ?? c.display_name,
+    online:      c.online,
+    since:       c.since,
+  }));
+}
+
 // ---------------------------------------------------------------------------
 // SECURE STORE HELPERS
 // ---------------------------------------------------------------------------
@@ -2494,8 +2506,8 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
     // Fetch accepted app contacts for green LED check
     let confirmedIds = new Set();
     try {
-      const data = await api('/api/contacts', 'GET', null, token);
-      confirmedIds = new Set((Array.isArray(data) ? data : []).map(c => c.userId));
+      const data = _normContacts(await api('/api/contacts', 'GET', null, token));
+      confirmedIds = new Set(data.map(c => c.userId));
       setAppContactIds(confirmedIds);
     } catch {}
 
@@ -3943,7 +3955,7 @@ function BotTab({ token, wsRef }) {
   useEffect(() => {
     if (!bpSend && !bpCon) return;
     api('/api/contacts', 'GET', null, token)
-      .then(data => { if (Array.isArray(data)) setContacts(data); })
+      .then(data => { const norm = _normContacts(data); if (norm.length) setContacts(norm); })
       .catch(() => {});
   }, [bpSend, bpCon, token]);
 
@@ -4673,8 +4685,8 @@ function ContactsTab({ token, currentUser, onOpenDM }) {
     if (isRefresh) setRefreshing(true); else setLoading(true);
     setErr('');
     try {
-      const c = await api('/api/contacts', 'GET', null, token);
-      setContacts(Array.isArray(c) ? c : []);
+      const c = _normContacts(await api('/api/contacts', 'GET', null, token));
+      setContacts(c);
     } catch (e) { setErr(e.message); }
     finally { setLoading(false); setRefreshing(false); }
   }, [token]);
