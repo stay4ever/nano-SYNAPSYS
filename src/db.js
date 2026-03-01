@@ -173,9 +173,13 @@ async function persistMessage(convoKey, msgId, fromId, plaintext, createdAt) {
     try { return JSON.parse(plaintext).url ?? null; } catch { return null; }
   })() : null;
   await db.executeAsync(
-    `INSERT OR IGNORE INTO messages
+    `INSERT INTO messages
        (id, convo_key, from_id, content, is_media, media_url, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       content   = excluded.content,
+       is_media  = excluded.is_media,
+       media_url = excluded.media_url`,
     [msgId, convoKey, String(fromId), plaintext, isMedia, mediaUrl, createdAt ?? new Date().toISOString()]
   );
   // Update cursor if this is a new high-water mark

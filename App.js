@@ -967,7 +967,15 @@ async function decryptDM(envelopeStr, senderId, token) {
     if (env?.sig === true && env?.v === 1) {
       const hdr = JSON.parse(env.hdr);
 
-      // If we have no session and x3dh metadata is present, build session as responder
+      // Load session from SecureStore if not in memory (e.g. after app restart)
+      if (!_sigSessions[senderId]) {
+        try {
+          const raw = await SecureStore.getItemAsync(sigSessStore(senderId));
+          if (raw) _sigSessions[senderId] = SIG.deserialiseSession(raw);
+        } catch {}
+      }
+
+      // If still no session and x3dh metadata is present, build session as responder
       if (!_sigSessions[senderId] && hdr.x3dh) {
         const x3 = hdr.x3dh;
         // Load our SPK secret key
@@ -1137,7 +1145,17 @@ async function decryptGroupMsg(envelopeStr, _unusedGroupKey, senderId, groupId) 
     // ── Signal Sender Key ────────────────────────────────────────────────────
     if (env?.gsig === true) {
       const cacheKey = `${groupId}_${senderId}`;
-      const state    = _sigSenderKeys[cacheKey];
+      let state = _sigSenderKeys[cacheKey];
+      // Load from SecureStore if not in memory (e.g. after app restart)
+      if (!state) {
+        try {
+          const raw = await SecureStore.getItemAsync(sigSKStore(groupId, senderId));
+          if (raw) {
+            state = SIG.deserialiseSKState(raw);
+            _sigSenderKeys[cacheKey] = state;
+          }
+        } catch {}
+      }
       if (!state) return null;
       const result = SIG.skDecrypt(state, env);
       if (!result) return null;
@@ -3182,7 +3200,11 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
         // Pre-populate decrypted cache — own echoed messages have plaintext in temp
         if (fromMe && isEncryptedDM(incomingMsg.content)) {
           const tempMsg = prev.find(m => m._temp);
-          if (tempMsg) setDecryptedMsgs(p => ({ ...p, [incomingMsg.id]: tempMsg.content }));
+          if (tempMsg) {
+            setDecryptedMsgs(p => ({ ...p, [incomingMsg.id]: tempMsg.content }));
+            // Persist plaintext immediately — sender can never re-decrypt own messages
+            DB.persistMessage(`dm_${peerId}`, incomingMsg.id, meId, tempMsg.content, incomingMsg.created_at).catch(() => {});
+          }
         }
         return [...base, incomingMsg];
       });
@@ -3282,6 +3304,8 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
         // Pre-populate decrypted cache for own encrypted message
         if (payload !== content && isEncryptedDM(payload)) {
           setDecryptedMsgs(p => ({ ...p, [msg.id]: content }));
+          // Persist plaintext immediately — sender can never re-decrypt own messages
+          DB.persistMessage(`dm_${peer.id}`, msg.id, String(currentUser.id), content, msg.created_at).catch(() => {});
         }
         setMessages((prev) => prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]);
       }
@@ -3739,6 +3763,8 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
           const plain = ownPlainRef.current[incomingMsg.content];
           delete ownPlainRef.current[incomingMsg.content];
           setDecryptedMsgs(p => ({ ...p, [incomingMsg.id]: plain }));
+          // Persist plaintext immediately — sender can never re-decrypt own messages
+          DB.persistMessage(`group_${group.id}`, incomingMsg.id, String(currentUser.id), plain, incomingMsg.created_at).catch(() => {});
         }
         return [...base, incomingMsg];
       });
@@ -3840,8 +3866,11 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
         const msg = await api(`/api/groups/${group.id}/messages`, 'POST', { content: payload }, token);
         // Pre-populate decrypted cache for own encrypted messages
         if (ownPlainRef.current[payload]) {
-          setDecryptedMsgs(p => ({ ...p, [msg.id]: ownPlainRef.current[payload] }));
+          const plain = ownPlainRef.current[payload];
+          setDecryptedMsgs(p => ({ ...p, [msg.id]: plain }));
           delete ownPlainRef.current[payload];
+          // Persist plaintext immediately — sender can never re-decrypt own messages
+          DB.persistMessage(`group_${group.id}`, msg.id, String(currentUser.id), plain, msg.created_at).catch(() => {});
         }
         setMessages((prev) => prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]);
       }
@@ -4517,6 +4546,7 @@ function ProfileTab({ token, currentUser, onLogout, profileImageUri, setProfileI
       <TouchableOpacity onPress={handlePickProfileImage} style={{ alignItems: 'center', marginVertical: 24 }}>
         {profileImageUri
           ? <Image source={{ uri: profileImageUri }} style={{ width: 96, height: 96, borderRadius: 48 }}
+              onError={() => setProfileImageUri(null)}
               />
           : <View style={{ width: 96, height: 96, borderRadius: 48, backgroundColor: avatarBg, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: C.accent }}>
               <Text style={{ color: '#fff', fontSize: 38, fontWeight: '700', fontFamily: mono }}>{initials}</Text>
@@ -5486,7 +5516,13 @@ function HomeScreen({ token, currentUser, onLogout }) {
           if (profile?.avatar_url) {
             if (profile.avatar_url.startsWith('data:')) {
               const b64 = profile.avatar_url.split(',')[1];
-              await FileSystem.writeAsStringAsync(destUri, b64, { encoding: FileSystem.EncodingType.Base64 });
+              try {
+                await FileSystem.writeAsStringAsync(destUri, b64, { encoding: FileSystem.EncodingType.Base64 });
+              } catch {
+                // If file write fails, use data URI directly
+                setProfileImageUri(profile.avatar_url);
+                return;
+              }
             } else {
               await FileSystem.downloadAsync(profile.avatar_url, destUri);
             }
