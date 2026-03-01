@@ -3181,12 +3181,14 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
     fetchPubKey(peer.id, token).then(pk => { peerPkRef.current = pk; }).catch(() => {});
   }, [peer.id, token]);
 
-  // Join the Phoenix channel topic for this DM so inbound messages arrive
+  // User topic is auto-joined at WS connect; no per-peer join needed for DMs
+
+  // Send read receipt when entering this DM conversation
   useEffect(() => {
-    if (wsRef.current && wsRef.current._phxJoin) {
-      wsRef.current._phxJoin(`room:${peer.id}`);
+    if (wsRef.current && wsRef.current._phxSend) {
+      wsRef.current._phxSend(`user:${currentUser.id}`, 'mark_read', { from: peer.id });
     }
-  }, [peer.id, wsRef]);
+  }, [peer.id, currentUser.id]);
 
   // Clean up all pending disappear timers on unmount
   useEffect(() => () => { disappearTimers.current.forEach(clearTimeout); }, []);
@@ -3225,7 +3227,7 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
     if (!incomingMsg || incomingMsg.type !== 'chat_message') return;
     // Handle both new snake_case (from_user) and legacy camelCase (from) field names
     const fromId = String(incomingMsg.from_user?.id ?? incomingMsg.from_user ?? incomingMsg.from);
-    const toId   = String(incomingMsg.to);
+    const toId   = String(incomingMsg.to_user?.id ?? incomingMsg.to_user ?? incomingMsg.to);
     const peerId = String(peer.id);
     const meId   = String(currentUser.id);
     // Show only messages that belong to THIS conversation
@@ -3256,6 +3258,13 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
         }, incomingMsg.disappear_after * 1000);
         disappearTimers.current.push(tid);
       }
+    }
+
+    // Handle read receipt: mark all own messages to this peer as read
+    if (incomingMsg?.type === 'messages_read' && String(incomingMsg.by) === String(peer.id)) {
+      setMessages(prev => prev.map(m =>
+        String(m.from_user ?? m.from) === String(currentUser.id) ? { ...m, read: true } : m
+      ));
     }
   }, [incomingMsg, peer.id, currentUser.id]);
 
@@ -3444,7 +3453,7 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
               ListEmptyComponent={<Text style={styles.emptyText}>NO MESSAGES YET</Text>}
               renderItem={({ item }) => {
                 const mine = isMine(item);
-                const { text: msgText, encrypted: isEnc, failed, isMedia } = resolveContent(item);
+                const { text: msgText, failed, isMedia } = resolveContent(item);
                 const mediaUri = isMedia ? getMediaUri(item) : null;
                 return (
                   <View style={[styles.msgRow, mine ? styles.msgRowMine : styles.msgRowTheirs]}>
@@ -3454,7 +3463,7 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
                       ) : isMedia ? (
                         mediaUri
                           ? <Image source={{ uri: mediaUri }} style={styles.imageMsg} resizeMode="contain" />
-                          : <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 9, color: mine ? '#ffffffaa' : C.dim }}>🔒 Loading image…</Text>
+                          : <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 9, color: mine ? '#ffffffaa' : C.dim }}>Loading image…</Text>
                       ) : isLocationContent(msgText) ? (
                         <TouchableOpacity onPress={() => {
                           const m = msgText.match(/\[LOCATION:([-\d.]+),([-\d.]+)\]/);
@@ -3472,10 +3481,7 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
                           </Text>
                         </TouchableOpacity>
                       ) : (
-                        <>
-                          {isEnc && <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 8, color: mine ? '#ffffff66' : C.dim, marginBottom: 2, letterSpacing: 0.5 }}>{failed ? '🔓 DECRYPTION FAILED' : '🔒 E2EE'}</Text>}
-                          <Text style={[styles.msgText, failed && { color: C.amber }]}>{msgText}</Text>
-                        </>
+                        <Text style={[styles.msgText, failed && { color: C.amber }]}>{msgText}</Text>
                       )}
                       <View style={styles.msgMeta}>
                         <Text style={styles.msgTime}>{fmtTime(item.created_at)}</Text>
@@ -4017,7 +4023,7 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
               renderItem={({ item }) => {
                 const mine = isMine(item);
                 const senderName = mine ? 'YOU' : (item.from_display || item.fromDisplay || item.from_username || item.fromUsername || 'UNKNOWN');
-                const { text: msgText, encrypted: isEnc, failed, isMedia } = resolveGroupContent(item);
+                const { text: msgText, failed, isMedia } = resolveGroupContent(item);
                 const mediaUri = isMedia ? getGroupMediaUri(item) : null;
                 return (
                   <View style={[styles.msgRow, mine ? styles.msgRowMine : styles.msgRowTheirs]}>
@@ -4028,7 +4034,7 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
                       ) : isMedia ? (
                         mediaUri
                           ? <Image source={{ uri: mediaUri }} style={styles.imageMsg} resizeMode="contain" />
-                          : <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 9, color: mine ? '#ffffffaa' : C.dim }}>🔒 Loading image…</Text>
+                          : <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 9, color: mine ? '#ffffffaa' : C.dim }}>Loading image…</Text>
                       ) : isLocationContent(msgText) ? (
                         <TouchableOpacity onPress={() => {
                           const m = msgText.match(/\[LOCATION:([-\d.]+),([-\d.]+)\]/);
@@ -4043,12 +4049,12 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
                           </Text>
                         </TouchableOpacity>
                       ) : (
-                        <>
-                          {isEnc && <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 8, color: mine ? '#ffffff66' : C.dim, marginBottom: 2, letterSpacing: 0.5 }}>{failed ? '🔓 DECRYPTION FAILED' : '🔒 E2EE'}</Text>}
-                          <Text style={[styles.msgText, failed && { color: C.amber }]}>{msgText}</Text>
-                        </>
+                        <Text style={[styles.msgText, failed && { color: C.amber }]}>{msgText}</Text>
                       )}
-                      <Text style={styles.msgTime}>{fmtTime(item.created_at)}</Text>
+                      <View style={styles.msgMeta}>
+                        <Text style={styles.msgTime}>{fmtTime(item.created_at)}</Text>
+                        {mine && <Text style={styles.msgRead}>{' \u2713'}</Text>}
+                      </View>
                     </View>
                   </View>
                 );
@@ -5653,6 +5659,8 @@ function HomeScreen({ token, currentUser, onLogout }) {
       backoffRef.current = 1000;
       // Phoenix heartbeat every 30 s keeps the connection alive
       ws._heartbeat = setInterval(() => phxSend('phoenix', 'heartbeat', {}), 30000);
+      // Auto-join own user topic so DMs broadcast by backend are received
+      if (currentUser?.id) ws._phxJoin(`user:${currentUser.id}`);
     };
 
     ws.onmessage = (event) => {
@@ -5663,8 +5671,8 @@ function HomeScreen({ token, currentUser, onLogout }) {
 
         const { topic, event: evtName, payload: pl } = frame;
 
-        // ── DM: Phoenix emits "new_message" on topic "room:<other_user_id>" ──
-        if (evtName === 'new_message') {
+        // ── DM: Phoenix emits "chat.message" on topic "user:<my_id>" ──
+        if (evtName === 'chat.message') {
           // Normalise into the shape the rest of the app already expects
           const msg = { ...pl, type: 'chat_message' };
           setIncomingMsg(msg);
@@ -5678,6 +5686,9 @@ function HomeScreen({ token, currentUser, onLogout }) {
               String(dmPeerRef.current.id) === fromId;
             if (!isViewingThisChat) {
               setUnreadCounts(prev => ({ ...prev, [`dm_${fromId}`]: (prev[`dm_${fromId}`] || 0) + 1 }));
+            } else {
+              // Viewing this chat — send read receipt immediately
+              phxSend(`user:${currentUser.id}`, 'mark_read', { from: parseInt(fromId) });
             }
             if (notifRef.current && !isViewingThisChat) {
               const sender = pl.from_user?.username || pl.from_username || 'Someone';
@@ -5688,6 +5699,12 @@ function HomeScreen({ token, currentUser, onLogout }) {
               showLocalNotification(`SYNAPTYC — ${sender}`, preview);
             }
           }
+        }
+
+        // ── Read receipt: sender is notified when recipient reads their messages ──
+        if (evtName === 'messages_read') {
+          const readBy = String(pl.by);
+          setIncomingMsg({ type: 'messages_read', by: readBy });
         }
 
         // ── Group: Phoenix emits "group.message" on topic "group:<group_id>" ──
