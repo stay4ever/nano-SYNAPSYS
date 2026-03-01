@@ -3185,6 +3185,9 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
   const peerPkRef               = useRef(null);  // cached peer public key (legacy compat)
   const [decryptedMsgs,  setDecryptedMsgs]  = useState({});
   const [decryptedMedia, setDecryptedMedia] = useState({});
+  const [peerTyping,     setPeerTyping]     = useState(false);
+  const typingTimeoutRef = useRef(null);
+  const lastTypingSentRef = useRef(0);
 
   // Pre-fetch peer's public key for E2EE (legacy NaCl compat)
   useEffect(() => {
@@ -3200,8 +3203,11 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
     }
   }, [peer.id, currentUser.id]);
 
-  // Clean up all pending disappear timers on unmount
-  useEffect(() => () => { disappearTimers.current.forEach(clearTimeout); }, []);
+  // Clean up all pending disappear timers and typing timeout on unmount
+  useEffect(() => () => {
+    disappearTimers.current.forEach(clearTimeout);
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+  }, []);
 
   const fetchHistory = useCallback(async () => {
     setLoading(true); setErr('');
@@ -3275,6 +3281,13 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
       setMessages(prev => prev.map(m =>
         String(m.from_user ?? m.from) === String(currentUser.id) ? { ...m, read: true } : m
       ));
+    }
+
+    // Handle typing indicator from peer
+    if (incomingMsg?.type === 'typing' && String(incomingMsg.from) === String(peer.id)) {
+      setPeerTyping(true);
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+      typingTimeoutRef.current = setTimeout(() => setPeerTyping(false), 3000);
     }
   }, [incomingMsg, peer.id, currentUser.id]);
 
@@ -3502,6 +3515,11 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
                 );
               }}
             />
+            {peerTyping && (
+              <Text style={{ fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 10, color: C.dim, paddingHorizontal: 16, paddingBottom: 4 }}>
+                {peer.display_name || peer.displayName || peer.username} is typing…
+              </Text>
+            )}
             <View style={styles.inputRow}>
               <TouchableOpacity style={styles.attachBtn} onPress={handleAttachment}>
                 <Text style={styles.attachBtnText}>+</Text>
@@ -3510,7 +3528,14 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
                 <IconPin size={18} color={C.accent} />
               </TouchableOpacity>
               <TextInput style={styles.chatInput} placeholder="MESSAGE..." placeholderTextColor={C.muted}
-                value={text} onChangeText={setText} multiline maxLength={2000}
+                value={text} onChangeText={(v) => {
+                  setText(v);
+                  const now = Date.now();
+                  if (v.length > 0 && now - lastTypingSentRef.current > 2000 && wsRef.current?._phxSend) {
+                    wsRef.current._phxSend(`user:${currentUser.id}`, 'typing', { to: peer.id });
+                    lastTypingSentRef.current = now;
+                  }
+                }} multiline maxLength={2000}
                 autoCorrect={false} spellCheck={false} />
               <TouchableOpacity style={[styles.sendBtn, (!text.trim() || sending) && styles.sendBtnDisabled]}
                 onPress={() => sendMessage()} disabled={!text.trim() || sending}>
@@ -5715,6 +5740,11 @@ function HomeScreen({ token, currentUser, onLogout }) {
         if (evtName === 'messages_read') {
           const readBy = String(pl.by);
           setIncomingMsg({ type: 'messages_read', by: readBy });
+        }
+
+        // ── Typing indicator ──
+        if (evtName === 'typing') {
+          setIncomingMsg({ type: 'typing', from: String(pl.from) });
         }
 
         // ── Group: Phoenix emits "group.message" on topic "group:<group_id>" ──
