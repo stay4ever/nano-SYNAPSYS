@@ -2492,13 +2492,20 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
   const loadAll = async (isRefresh = false) => {
     if (isRefresh) setRefreshing(true);
     // Fetch accepted app contacts for green LED check
+    let confirmedIds = new Set();
     try {
       const data = await api('/api/contacts', 'GET', null, token);
-      setAppContactIds(new Set((Array.isArray(data) ? data : []).map(c => c.userId)));
+      confirmedIds = new Set((Array.isArray(data) ? data : []).map(c => c.userId));
+      setAppContactIds(confirmedIds);
     } catch {}
 
-    // Load persisted statuses
+    // Load persisted statuses — clear stale 'c' entries (re-verified by autoSearch)
     const loaded = await _pcLoad();
+    let cleaned = false;
+    for (const k of Object.keys(loaded)) {
+      if (loaded[k].s === 'c') { delete loaded[k]; cleaned = true; }
+    }
+    if (cleaned) SecureStore.setItemAsync(_PC_KEY, JSON.stringify(loaded)).catch(() => {});
     setPhoneStatuses(loaded);
 
     // Request contacts permission (returns accessPrivileges on iOS 18+)
@@ -2533,8 +2540,8 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
         .filter(c => c.phone)
         .sort((a, b) => a.name.localeCompare(b.name));
       setDeviceContacts(list);
-      // Auto-search in background — no await, silent fail
-      autoSearchContacts(list).catch(() => {});
+      // Auto-search in background — pass confirmedIds directly (React state may not be updated yet)
+      autoSearchContacts(list, confirmedIds).catch(() => {});
     } catch (e) {
       setContactsErr('Could not load contacts: ' + (e?.message || String(e)));
     } finally {
@@ -2543,9 +2550,10 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
     }
   };
 
-  // Auto-detect which contacts are on the app and auto-add them
-  const autoSearchContacts = async (contacts) => {
+  // Auto-detect which phone contacts are already confirmed app contacts (green LED)
+  const autoSearchContacts = async (contacts, confirmedIds) => {
     setAutoSearching(true);
+    const ids = confirmedIds || appContactIds;
     const todo = contacts.slice(0, 50); // cap at 50 to stay responsive
     const results = await Promise.allSettled(todo.map(async (c) => {
       const q = c.name.split(' ')[0].trim();
@@ -2554,33 +2562,19 @@ function PhoneContactsSheet({ visible, onClose, token, currentUser, onOpenDM }) 
         const data = await api(`/api/users/search?q=${encodeURIComponent(q)}`, 'GET', null, token);
         const all = Array.isArray(data) ? data : [];
         if (all.length === 0) return null;
-        // Prefer already-known contact; accept single unambiguous match
-        const match = all.find(u => appContactIds.has(u.id)) ?? (all.length === 1 ? all[0] : null);
+        // ONLY match users already confirmed as contacts — never auto-add strangers
+        const match = all.find(u => ids.has(u.id));
         return match ? { phone: c.phone, user: match } : null;
       } catch { return null; }
     }));
     const map = {};
-    const newIds = new Set();
     for (const r of results) {
       if (r.status !== 'fulfilled' || !r.value) continue;
       const { phone, user } = r.value;
       map[phone] = user;
-      // Auto-add as contact + set green LED if not already a contact
-      if (!appContactIds.has(user.id)) {
-        try {
-          await api('/api/contacts/request', 'POST', { userId: user.id }, token);
-          newIds.add(user.id);
-          await _pcSave(phone, { s: 'c' });
-        } catch {}
-      } else {
-        // Already a contact — ensure green LED
-        await _pcSave(phone, { s: 'c' });
-      }
+      // Set green LED for confirmed contacts
+      await _pcSave(phone, { s: 'c' });
     }
-    if (newIds.size > 0) {
-      setAppContactIds(prev => new Set([...prev, ...newIds]));
-    }
-    // Reload phone statuses to reflect all changes
     setPhoneStatuses(await _pcLoad());
     setAutoMatchedMap(map);
     setAutoSearching(false);
