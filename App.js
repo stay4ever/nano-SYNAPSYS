@@ -3939,7 +3939,7 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
       // Phoenix channel: join the group topic, then push via group_message event
       if (!isImage && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && wsRef.current._phxSend) {
         wsRef.current._phxJoin(`group:${group.id}`);
-        wsRef.current._phxSend(`group:${group.id}`, 'group_message', { content: payload });
+        wsRef.current._phxSend(`group:${group.id}`, 'group_message', { content: payload, group_id: group.id });
         // Optimistic push — show plaintext immediately; server echo will replace temp on arrival
         const tempId = `temp_${Date.now()}`;
         setMessages(prev => [...prev, {
