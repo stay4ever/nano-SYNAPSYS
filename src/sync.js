@@ -26,15 +26,17 @@ async function syncDM(peerId, token, decryptFn) {
     const msgs = await apiFetch(`/api/messages/${peerId}?after_id=${lastId}`, token);
     if (!Array.isArray(msgs) || msgs.length === 0) return;
 
-    const decrypted = await Promise.all(msgs.map(async (m) => {
+    // Decrypt SEQUENTIALLY — Double Ratchet is stateful, concurrent decrypt corrupts session
+    const decrypted = [];
+    for (const m of msgs) {
       let content = m.content;
       try {
         const sid = String(m.from_user?.id ?? m.from_user ?? m.from ?? '');
         const plain = await decryptFn(m.content, sid, token);
         if (plain !== null) content = plain;
       } catch {}
-      return { ...m, content };
-    }));
+      decrypted.push({ ...m, content });
+    }
 
     await upsertMessages(`dm_${peerId}`, decrypted);
     const maxId = Math.max(...msgs.map(m => m.id));
@@ -54,15 +56,17 @@ async function syncGroup(groupId, token, decryptFn) {
     const msgs = await apiFetch(`/api/groups/${groupId}/messages?after_id=${lastId}`, token);
     if (!Array.isArray(msgs) || msgs.length === 0) return;
 
-    const decrypted = await Promise.all(msgs.map(async (m) => {
+    // Decrypt SEQUENTIALLY — sender key chain is stateful, concurrent decrypt corrupts state
+    const decrypted = [];
+    for (const m of msgs) {
       let content = m.content;
       try {
         const sid = String(m.from_user?.id ?? m.from_user ?? m.from ?? '');
         const plain = await decryptFn(m.content, null, sid, groupId);
         if (plain !== null) content = plain;
       } catch {}
-      return { ...m, content };
-    }));
+      decrypted.push({ ...m, content });
+    }
 
     await upsertMessages(`group_${groupId}`, decrypted);
     const maxId = Math.max(...msgs.map(m => m.id));

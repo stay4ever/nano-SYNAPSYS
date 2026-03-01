@@ -3184,6 +3184,7 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
   const disappearTimers         = useRef([]);
   const peerPkRef               = useRef(null);  // cached peer public key (legacy compat)
   const [decryptedMsgs,  setDecryptedMsgs]  = useState({});
+  const decryptedMsgsRef = useRef({});   // always-current mirror — survives effect cancellation
   const [decryptedMedia, setDecryptedMedia] = useState({});
   const [peerTyping,     setPeerTyping]     = useState(false);
   const typingTimeoutRef = useRef(null);
@@ -3240,51 +3241,56 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
   useEffect(() => { fetchHistory(); }, [fetchHistory]);
 
   useEffect(() => {
-    if (!incomingMsg || incomingMsg.type !== 'chat_message') return;
-    // Handle both new snake_case (from_user) and legacy camelCase (from) field names
-    const fromId = String(incomingMsg.from_user?.id ?? incomingMsg.from_user ?? incomingMsg.from);
-    const toId   = String(incomingMsg.to_user?.id ?? incomingMsg.to_user ?? incomingMsg.to);
-    const peerId = String(peer.id);
-    const meId   = String(currentUser.id);
-    // Show only messages that belong to THIS conversation
-    const belongs = (fromId === peerId && toId === meId) ||
-                    (fromId === meId   && toId === peerId);
-    if (belongs) {
-      const fromMe = fromId === meId;
-      setMessages((prev) => {
-        // Remove temp (optimistic) messages from self when real echo arrives
-        const base = fromMe ? prev.filter(m => !m._temp) : prev;
-        if (base.some(m => m.id === incomingMsg.id)) return base;
-        // Pre-populate decrypted cache — own echoed messages have plaintext in temp
-        if (fromMe && isEncryptedDM(incomingMsg.content)) {
-          const tempMsg = prev.find(m => m._temp);
-          if (tempMsg) {
-            setDecryptedMsgs(p => ({ ...p, [incomingMsg.id]: tempMsg.content }));
-            // Persist plaintext immediately — sender can never re-decrypt own messages
-            DB.persistMessage(`dm_${peerId}`, incomingMsg.id, meId, tempMsg.content, incomingMsg.created_at).catch(() => {});
+    if (!incomingMsg) return;
+
+    // ── DM message ──
+    if (incomingMsg.type === 'chat_message') {
+      // Handle both new snake_case (from_user) and legacy camelCase (from) field names
+      const fromId = String(incomingMsg.from_user?.id ?? incomingMsg.from_user ?? incomingMsg.from);
+      const toId   = String(incomingMsg.to_user?.id ?? incomingMsg.to_user ?? incomingMsg.to);
+      const peerId = String(peer.id);
+      const meId   = String(currentUser.id);
+      // Show only messages that belong to THIS conversation
+      const belongs = (fromId === peerId && toId === meId) ||
+                      (fromId === meId   && toId === peerId);
+      if (belongs) {
+        const fromMe = fromId === meId;
+        setMessages((prev) => {
+          // Remove temp (optimistic) messages from self when real echo arrives
+          const base = fromMe ? prev.filter(m => !m._temp) : prev;
+          if (base.some(m => m.id === incomingMsg.id)) return base;
+          // Pre-populate decrypted cache — own echoed messages have plaintext in temp
+          if (fromMe && isEncryptedDM(incomingMsg.content)) {
+            const tempMsg = prev.find(m => m._temp);
+            if (tempMsg) {
+              decryptedMsgsRef.current[incomingMsg.id] = tempMsg.content;
+              setDecryptedMsgs(p => ({ ...p, [incomingMsg.id]: tempMsg.content }));
+              // Persist plaintext immediately — sender can never re-decrypt own messages
+              DB.persistMessage(`dm_${peerId}`, incomingMsg.id, meId, tempMsg.content, incomingMsg.created_at).catch(() => {});
+            }
           }
+          return [...base, incomingMsg];
+        });
+        // Schedule disappear if requested — track timer so it's cancelled on unmount
+        if (incomingMsg.disappear_after && incomingMsg.disappear_after > 0) {
+          const msgId = incomingMsg.id;
+          const tid = setTimeout(() => {
+            setMessages(prev => prev.filter(m => m.id !== msgId));
+          }, incomingMsg.disappear_after * 1000);
+          disappearTimers.current.push(tid);
         }
-        return [...base, incomingMsg];
-      });
-      // Schedule disappear if requested — track timer so it's cancelled on unmount
-      if (incomingMsg.disappear_after && incomingMsg.disappear_after > 0) {
-        const msgId = incomingMsg.id;
-        const tid = setTimeout(() => {
-          setMessages(prev => prev.filter(m => m.id !== msgId));
-        }, incomingMsg.disappear_after * 1000);
-        disappearTimers.current.push(tid);
       }
     }
 
-    // Handle read receipt: mark all own messages to this peer as read
-    if (incomingMsg?.type === 'messages_read' && String(incomingMsg.by) === String(peer.id)) {
+    // ── Read receipt: mark all own messages to this peer as read ──
+    if (incomingMsg.type === 'messages_read' && String(incomingMsg.by) === String(peer.id)) {
       setMessages(prev => prev.map(m =>
         String(m.from_user ?? m.from) === String(currentUser.id) ? { ...m, read: true } : m
       ));
     }
 
-    // Handle typing indicator from peer
-    if (incomingMsg?.type === 'typing' && String(incomingMsg.from) === String(peer.id)) {
+    // ── Typing indicator from peer ──
+    if (incomingMsg.type === 'typing' && String(incomingMsg.from) === String(peer.id)) {
       setPeerTyping(true);
       if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
       typingTimeoutRef.current = setTimeout(() => setPeerTyping(false), 3000);
@@ -3297,16 +3303,17 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
 
   // Async decrypt all encrypted DMs whenever the message list changes.
   // Also persists newly decrypted messages to the local SQLCipher DB.
+  // Uses decryptedMsgsRef (not state) for the "already decrypted?" check
+  // to survive effect cancellation when new messages arrive mid-decrypt.
   useEffect(() => {
     let alive = true;
     (async () => {
       const updates = {};
       for (const msg of messages) {
         if (isEncryptedDM(msg.content)) {
-          // Skip if already resolved (success OR failure) — never re-attempt
-          // Re-attempting corrupts the Double Ratchet session state
-          if (decryptedMsgs[msg.id]) {
-            updates[msg.id] = decryptedMsgs[msg.id];
+          // Check ref (always current) — state can be stale after effect cancellation
+          if (decryptedMsgsRef.current[msg.id]) {
+            updates[msg.id] = decryptedMsgsRef.current[msg.id];
           } else {
             const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? msg.from_id ?? '');
             // Try local DB first (fastest, avoids touching session state)
@@ -3321,6 +3328,8 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
             }
             const resolved = plain ?? '[Encrypted — cannot decrypt]';
             updates[msg.id] = resolved;
+            // Update ref immediately — survives effect cancellation
+            decryptedMsgsRef.current[msg.id] = resolved;
             if (plain !== null) {
               DB.persistMessage(`dm_${peer.id}`, msg.id, sid, plain, msg.created_at).catch(() => {});
             }
@@ -3377,6 +3386,7 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
         const msg = await api('/api/messages', 'POST', { to: peer.id, content: payload }, token);
         // Pre-populate decrypted cache for own encrypted message
         if (payload !== content && isEncryptedDM(payload)) {
+          decryptedMsgsRef.current[msg.id] = content;
           setDecryptedMsgs(p => ({ ...p, [msg.id]: content }));
           // Persist plaintext immediately — sender can never re-decrypt own messages
           DB.persistMessage(`dm_${peer.id}`, msg.id, String(currentUser.id), content, msg.created_at).catch(() => {});
@@ -3781,6 +3791,7 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
   const disappearTimers             = useRef([]);
   const groupKeyRef                 = useRef(null);  // legacy NaCl group key (compat)
   const [decryptedMsgs,  setDecryptedMsgs]  = useState({});
+  const decryptedMsgsRef = useRef({});   // always-current mirror — survives effect cancellation
   const [decryptedMedia, setDecryptedMedia] = useState({});
   const [senderKeysReady, setSenderKeysReady] = useState(false);
   const ownPlainRef = useRef({});  // encrypted payload hash → plaintext for own sent messages
@@ -3845,6 +3856,7 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
         if (fromMe && isEncryptedGroup(incomingMsg.content) && ownPlainRef.current[incomingMsg.content]) {
           const plain = ownPlainRef.current[incomingMsg.content];
           delete ownPlainRef.current[incomingMsg.content];
+          decryptedMsgsRef.current[incomingMsg.id] = plain;
           setDecryptedMsgs(p => ({ ...p, [incomingMsg.id]: plain }));
           // Persist plaintext immediately — sender can never re-decrypt own messages
           DB.persistMessage(`group_${group.id}`, incomingMsg.id, String(currentUser.id), plain, incomingMsg.created_at).catch(() => {});
@@ -3867,16 +3879,17 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
 
   // Async decrypt all encrypted group messages whenever the message list changes.
   // Also persists newly decrypted messages to the local SQLCipher DB.
+  // Uses decryptedMsgsRef (not state) for the "already decrypted?" check
+  // to survive effect cancellation when new messages arrive mid-decrypt.
   useEffect(() => {
     let alive = true;
     (async () => {
       const updates = {};
       for (const msg of messages) {
         if (isEncryptedGroup(msg.content)) {
-          // Skip if already resolved (success OR failure) — never re-attempt
-          // Re-attempting corrupts the sender key chain state
-          if (decryptedMsgs[msg.id]) {
-            updates[msg.id] = decryptedMsgs[msg.id];
+          // Check ref (always current) — state can be stale after effect cancellation
+          if (decryptedMsgsRef.current[msg.id]) {
+            updates[msg.id] = decryptedMsgsRef.current[msg.id];
           } else {
             const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? msg.from_id ?? '');
             // Try local DB first (fastest, avoids touching sender key state)
@@ -3893,6 +3906,8 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
             }
             const resolved = plain ?? '[Encrypted — cannot decrypt]';
             updates[msg.id] = resolved;
+            // Update ref immediately — survives effect cancellation
+            decryptedMsgsRef.current[msg.id] = resolved;
             if (plain !== null) {
               DB.persistMessage(`group_${group.id}`, msg.id, sid, plain, msg.created_at).catch(() => {});
             }
@@ -3951,6 +3966,7 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
         // Pre-populate decrypted cache for own encrypted messages
         if (ownPlainRef.current[payload]) {
           const plain = ownPlainRef.current[payload];
+          decryptedMsgsRef.current[msg.id] = plain;
           setDecryptedMsgs(p => ({ ...p, [msg.id]: plain }));
           delete ownPlainRef.current[payload];
           // Persist plaintext immediately — sender can never re-decrypt own messages
