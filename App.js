@@ -1009,8 +1009,15 @@ async function decryptDM(envelopeStr, senderId, token) {
 
       if (!_sigSessions[senderId]) return null;
 
+      // Backup session before decrypt — drDecrypt mutates state even on failure
+      const sessBackup = SIG.serialiseSession(_sigSessions[senderId]);
       const plain = SIG.drDecrypt(_sigSessions[senderId], hdr, env.ct);
-      await _saveSession(senderId);
+      if (plain !== null) {
+        await _saveSession(senderId);
+      } else {
+        // Restore session — failed decryption corrupted the ratchet state
+        _sigSessions[senderId] = SIG.deserialiseSession(sessBackup);
+      }
       return plain;
     }
 
@@ -3231,18 +3238,21 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
       const updates = {};
       for (const msg of messages) {
         if (isEncryptedDM(msg.content)) {
-          // Skip if already decrypted (e.g. own sent messages pre-cached)
-          if (decryptedMsgs[msg.id] && decryptedMsgs[msg.id] !== '[Encrypted — cannot decrypt]' && decryptedMsgs[msg.id] !== '[Decrypting…]') {
+          // Skip if already resolved (success OR failure) — never re-attempt
+          // Re-attempting corrupts the Double Ratchet session state
+          if (decryptedMsgs[msg.id]) {
             updates[msg.id] = decryptedMsgs[msg.id];
           } else {
-            const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? '');
-            let plain = await decryptDM(msg.content, sid, token);
-            // Fallback: try local DB (may have plaintext from prior session)
+            const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? msg.from_id ?? '');
+            // Try local DB first (fastest, avoids touching session state)
+            let plain = null;
+            try {
+              const cached = await DB.getMessage(`dm_${peer.id}`, msg.id);
+              if (cached?.content && !isEncryptedDM(cached.content)) plain = cached.content;
+            } catch {}
+            // Only attempt live decryption if DB had no plaintext
             if (plain === null) {
-              try {
-                const cached = await DB.getMessage(`dm_${peer.id}`, msg.id);
-                if (cached?.content) plain = cached.content;
-              } catch {}
+              plain = await decryptDM(msg.content, sid, token);
             }
             const resolved = plain ?? '[Encrypted — cannot decrypt]';
             updates[msg.id] = resolved;
@@ -3256,7 +3266,7 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
         if (resolved && MEDIA.isMediaPayload(resolved) && !decryptedMedia[msg.id]) {
           const mp = MEDIA.parseMediaPayload(resolved);
           if (mp) {
-            MEDIA.decryptMedia(mp.url, mp.key, mp.iv).then(uri => {
+            MEDIA.decryptMedia(mp.url, mp.key, mp.nonce).then(uri => {
               if (alive) setDecryptedMedia(prev => ({ ...prev, [msg.id]: uri }));
             }).catch(() => {});
           }
@@ -3359,7 +3369,7 @@ function DMChatScreen({ token, currentUser, peer, onBack, wsRef, incomingMsg, di
     } catch (e) { Alert.alert('ERROR', 'Failed to get location: ' + e.message); }
   }, [sendMessage]);
 
-  const isMine = (msg) => String(msg.from_user?.id ?? msg.from_user ?? msg.from) === String(currentUser.id);
+  const isMine = (msg) => String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? msg.from_id) === String(currentUser.id);
   // Resolve plaintext from a message — reads from async-decrypted cache or DB-loaded content
   const resolveContent = (msg) => {
     const raw = isEncryptedDM(msg.content) ? decryptedMsgs[msg.id] : msg.content;
@@ -3790,27 +3800,28 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
       const updates = {};
       for (const msg of messages) {
         if (isEncryptedGroup(msg.content)) {
-          // Skip if already decrypted (e.g. own sent messages pre-cached)
-          if (decryptedMsgs[msg.id] && decryptedMsgs[msg.id] !== '[Encrypted — cannot decrypt]' && decryptedMsgs[msg.id] !== '[Decrypting…]') {
+          // Skip if already resolved (success OR failure) — never re-attempt
+          // Re-attempting corrupts the sender key chain state
+          if (decryptedMsgs[msg.id]) {
             updates[msg.id] = decryptedMsgs[msg.id];
           } else {
-            const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? '');
+            const sid = String(msg.from_user?.id ?? msg.from_user ?? msg.from ?? msg.from_id ?? '');
+            // Try local DB first (fastest, avoids touching sender key state)
+            let plain = null;
             try {
-              let plain = await decryptGroupMsg(msg.content, null, sid, group.id);
-              // If decryption failed, try local DB (may have plaintext from prior session)
-              if (plain === null) {
-                try {
-                  const cached = await DB.getMessage(`group_${group.id}`, msg.id);
-                  if (cached?.content) plain = cached.content;
-                } catch {}
-              }
-              const resolved = plain ?? '[Encrypted — cannot decrypt]';
-              updates[msg.id] = resolved;
-              if (plain !== null) {
-                DB.persistMessage(`group_${group.id}`, msg.id, sid, plain, msg.created_at).catch(() => {});
-              }
-            } catch {
-              updates[msg.id] = '[Encrypted — cannot decrypt]';
+              const cached = await DB.getMessage(`group_${group.id}`, msg.id);
+              if (cached?.content && !isEncryptedGroup(cached.content)) plain = cached.content;
+            } catch {}
+            // Only attempt live decryption if DB had no plaintext
+            if (plain === null) {
+              try {
+                plain = await decryptGroupMsg(msg.content, null, sid, group.id);
+              } catch {}
+            }
+            const resolved = plain ?? '[Encrypted — cannot decrypt]';
+            updates[msg.id] = resolved;
+            if (plain !== null) {
+              DB.persistMessage(`group_${group.id}`, msg.id, sid, plain, msg.created_at).catch(() => {});
             }
           }
         }
@@ -3819,7 +3830,7 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
         if (resolved && MEDIA.isMediaPayload(resolved) && !decryptedMedia[msg.id]) {
           const mp = MEDIA.parseMediaPayload(resolved);
           if (mp) {
-            MEDIA.decryptMedia(mp.url, mp.key, mp.iv).then(uri => {
+            MEDIA.decryptMedia(mp.url, mp.key, mp.nonce).then(uri => {
               if (alive) setDecryptedMedia(prev => ({ ...prev, [msg.id]: uri }));
             }).catch(() => {});
           }
@@ -3926,7 +3937,7 @@ function GroupChatScreen({ token, currentUser, group, onBack, wsRef, incomingMsg
 
   // Handle both new snake_case (from_user) and legacy camelCase (from) field names
   const isMine = (msg) => {
-    const id = msg.from_user?.id ?? msg.from_user ?? msg.from;
+    const id = msg.from_user?.id ?? msg.from_user ?? msg.from ?? msg.from_id;
     return String(id) === String(currentUser.id);
   };
   const resolveGroupContent = (msg) => {

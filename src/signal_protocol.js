@@ -351,7 +351,7 @@ function skEncrypt(senderKeyState, plaintext, senderId) {
       gsig: true,
       v:    1,
       sid:  senderId,
-      hdr:  b64enc(new Uint8Array([senderKeyState.iteration])),
+      hdr:  b64enc(new Uint8Array(new Uint32Array([senderKeyState.iteration]).buffer)),
       ct:   b64enc(concat(nonce, ct)),
     },
   };
@@ -363,7 +363,11 @@ function skEncrypt(senderKeyState, plaintext, senderId) {
  */
 function skDecrypt(senderKeyState, envelope) {
   try {
-    const iteration = b64dec(envelope.hdr)[0];
+    const hdrBytes = b64dec(envelope.hdr);
+    // Support both old 1-byte and new 4-byte (uint32 LE) iteration headers
+    const iteration = hdrBytes.length >= 4
+      ? new DataView(hdrBytes.buffer, hdrBytes.byteOffset, 4).getUint32(0, true)
+      : hdrBytes[0];
     const [state, mk] = senderKeyState.iteration <= iteration
       ? skAdvanceTo(senderKeyState, iteration)
       : [senderKeyState, null];                 // out-of-order — key may be cached

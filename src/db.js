@@ -87,9 +87,13 @@ async function upsertMessages(convoKey, msgs) {
         try { return JSON.parse(content).url ?? null; } catch { return null; }
       })() : null;
       await db.executeAsync(
-        `INSERT OR IGNORE INTO messages
+        `INSERT INTO messages
            (id, convo_key, from_id, content, is_media, media_url, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           content   = excluded.content,
+           is_media  = excluded.is_media,
+           media_url = excluded.media_url`,
         [m.id, convoKey, fromId, content, isMedia, mediaUrl, m.created_at ?? new Date().toISOString()]
       );
     }

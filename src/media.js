@@ -3,68 +3,65 @@
  *
  * Flow:
  *   1. Pick image → base64 from expo-image-picker
- *   2. Encrypt with AES-256-GCM (WebCrypto / Hermes SubtleCrypto)
+ *   2. Encrypt with XSalsa20-Poly1305 (tweetnacl nacl.secretbox)
  *   3. Request presigned PUT URL from Elixir backend
  *   4. PUT encrypted bytes directly to R2
- *   5. Share { url, key, iv } JSON payload, which is then Signal-encrypted
+ *   5. Share { url, key, nonce } JSON payload, which is then Signal-encrypted
  *
  * Receiving:
- *   1. Signal-decrypt message → parse { type:"media", url, key, iv }
- *   2. Fetch R2 URL → AES-GCM decrypt → render as data URI
+ *   1. Signal-decrypt message → parse { type:"media", url, key, nonce }
+ *   2. Fetch R2 URL → nacl.secretbox.open decrypt → render as data URI
  *
- * Encrypted media is opaque to anyone without the AES key (even Cloudflare).
+ * Encrypted media is opaque to anyone without the key (even Cloudflare).
+ *
+ * NOTE: Uses tweetnacl instead of WebCrypto because Hermes (React Native's
+ * JS engine) does not provide crypto.subtle.
  */
+
+const nacl     = require('tweetnacl');
+const naclUtil = require('tweetnacl-util');
 
 const BASE_URL = 'https://nano-synapsys-server.fly.dev';
 
 /**
- * Encrypt raw image bytes with AES-256-GCM.
- * Returns { cipherBytes: Uint8Array, key: base64, iv: base64 }
+ * Encrypt raw image bytes with XSalsa20-Poly1305 (nacl.secretbox).
+ * Returns { cipherBytes: Uint8Array, key: base64, nonce: base64 }
  */
-async function encryptMedia(base64Data) {
+function encryptMedia(base64Data) {
   // Decode base64 → bytes
-  const binaryStr = atob(base64Data);
-  const raw = new Uint8Array(binaryStr.length);
-  for (let i = 0; i < binaryStr.length; i++) raw[i] = binaryStr.charCodeAt(i);
+  const raw = naclUtil.decodeBase64(base64Data);
 
-  // Generate random AES-256 key and 96-bit IV
-  const key = await crypto.subtle.generateKey(
-    { name: 'AES-GCM', length: 256 },
-    true,
-    ['encrypt']
-  );
-  const iv = crypto.getRandomValues(new Uint8Array(12));
+  // Generate random 32-byte key and 24-byte nonce
+  const key   = nacl.randomBytes(nacl.secretbox.keyLength);    // 32 bytes
+  const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);  // 24 bytes
 
   // Encrypt
-  const cipherBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, raw);
+  const cipherBytes = nacl.secretbox(raw, nonce, key);
 
-  // Export key to base64
-  const rawKey = await crypto.subtle.exportKey('raw', key);
-  const k64 = btoa(String.fromCharCode(...new Uint8Array(rawKey)));
-  const iv64 = btoa(String.fromCharCode(...iv));
-
-  return { cipherBytes: new Uint8Array(cipherBuf), key: k64, iv: iv64 };
+  return {
+    cipherBytes,
+    key:   naclUtil.encodeBase64(key),
+    nonce: naclUtil.encodeBase64(nonce),
+  };
 }
 
 /**
- * Decrypt AES-256-GCM encrypted media fetched from R2.
+ * Decrypt XSalsa20-Poly1305 encrypted media fetched from R2.
  * Returns a data URI string (e.g. 'data:image/jpeg;base64,...').
  */
-async function decryptMedia(url, key64, iv64) {
+async function decryptMedia(url, key64, nonce64) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`R2 fetch failed: ${res.status}`);
   const cipherBuf = await res.arrayBuffer();
+  const cipherBytes = new Uint8Array(cipherBuf);
 
-  // Import key
-  const rawKey = Uint8Array.from(atob(key64), c => c.charCodeAt(0));
-  const key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['decrypt']);
+  const key   = naclUtil.decodeBase64(key64);
+  const nonce = naclUtil.decodeBase64(nonce64);
 
-  // Decrypt
-  const iv = Uint8Array.from(atob(iv64), c => c.charCodeAt(0));
-  const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, cipherBuf);
+  const plainBytes = nacl.secretbox.open(cipherBytes, nonce, key);
+  if (!plainBytes) throw new Error('Media decryption failed — wrong key or corrupted data');
 
-  // Convert to data URI (assume JPEG; actual type is stored in the URL extension if needed)
-  const b64 = btoa(String.fromCharCode(...new Uint8Array(plainBuf)));
+  const b64 = naclUtil.encodeBase64(plainBytes);
   return `data:image/jpeg;base64,${b64}`;
 }
 
@@ -74,7 +71,7 @@ async function decryptMedia(url, key64, iv64) {
  * @param {string} base64Data - raw base64 image data (no prefix)
  * @param {string} mimeType   - e.g. 'image/jpeg'
  * @param {string} token      - Elixir JWT token for presign endpoint
- * @returns {{ url: string, key: string, iv: string }}
+ * @returns {{ url: string, key: string, nonce: string }}
  */
 async function uploadEncryptedMedia(base64Data, mimeType, token) {
   // 1. Get presigned PUT URL from Elixir backend
@@ -89,8 +86,8 @@ async function uploadEncryptedMedia(base64Data, mimeType, token) {
   if (!presignRes.ok) throw new Error(`Presign failed: ${presignRes.status}`);
   const { upload_url, public_url } = await presignRes.json();
 
-  // 2. Encrypt locally
-  const { cipherBytes, key, iv } = await encryptMedia(base64Data);
+  // 2. Encrypt locally (synchronous — no WebCrypto needed)
+  const { cipherBytes, key, nonce } = encryptMedia(base64Data);
 
   // 3. Upload encrypted bytes directly to R2 (no auth needed — presigned)
   const uploadRes = await fetch(upload_url, {
@@ -100,15 +97,15 @@ async function uploadEncryptedMedia(base64Data, mimeType, token) {
   });
   if (!uploadRes.ok) throw new Error(`R2 upload failed: ${uploadRes.status}`);
 
-  return { url: public_url, key, iv };
+  return { url: public_url, key, nonce };
 }
 
 /**
  * Build the JSON payload string for an encrypted media message.
  * This string is then passed to sendMessage(), which Signal-encrypts it.
  */
-function mediaPayload(url, key, iv) {
-  return JSON.stringify({ type: 'media', url, key, iv });
+function mediaPayload(url, key, nonce) {
+  return JSON.stringify({ type: 'media', url, key, nonce });
 }
 
 /**
@@ -124,12 +121,15 @@ function isMediaPayload(content) {
 
 /**
  * Parse a media payload JSON string.
- * Returns { url, key, iv } or null.
+ * Returns { url, key, nonce } or null.
+ * Supports both new format (nonce) and old format (iv) for backward compat.
  */
 function parseMediaPayload(content) {
   try {
     const obj = JSON.parse(content);
-    if (obj?.type === 'media' && obj.url && obj.key && obj.iv) return obj;
+    if (obj?.type === 'media' && obj.url && obj.key && (obj.nonce || obj.iv)) {
+      return { url: obj.url, key: obj.key, nonce: obj.nonce || obj.iv };
+    }
   } catch {}
   return null;
 }
